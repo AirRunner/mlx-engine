@@ -1,12 +1,14 @@
 import logging
 from pathlib import Path
+from typing import Optional
 
 from mlx import nn
 import mlx.core as mx
 
 from mlx_engine.model_kit.vision_add_ons.base import BaseVisionAddOn
 from mlx_engine.model_kit.vision_add_ons.load_utils import load_vision_addon
-from mlx_engine.model_kit.vision_add_ons.qwen_vl_utils import compute_qwen_vl_embeddings
+from mlx_engine.utils.image_utils import convert_to_pil, custom_resize
+from mlx_vlm.utils import prepare_inputs
 
 from mlx_vlm.models.qwen3_5 import (
     VisionModel as Qwen3_5VisionTower,
@@ -152,6 +154,46 @@ class Qwen3_5VisionAddOn(BaseVisionAddOn):
         """Reset MRoPE state injected by compute_embeddings."""
         text_model.language_model.model.reset_mrope_state()
 
+    def _prepare_inputs(
+        self,
+        text_model: nn.Module,
+        prompt_tokens,
+        images_b64: list[str],
+        max_size: tuple[int, int] | None,
+    ) -> tuple:
+        """Tokenize prompt and preprocess images without running the vision tower.
+
+        Sets rope_deltas on text_model for correct decode-step positioning.
+        Returns (input_ids, grid_thw, pixel_values, position_ids).
+        position_ids is None when no images are present.
+        input_ids has no batch dimension.
+        """
+        images = convert_to_pil(images_b64)
+        images = custom_resize(images, max_size=max_size, should_pad=False)
+        tokens = (
+            prompt_tokens if isinstance(prompt_tokens, list) else prompt_tokens.tolist()
+        )
+        prompt = self.processor.decode(tokens)
+        inputs = prepare_inputs(
+            processor=self.processor,
+            images=images,
+            prompts=prompt,
+            image_token_index=self.config.image_token_id,
+            resize_shape=None,
+        )
+        input_ids = inputs["input_ids"].squeeze(0)
+        pixel_values = inputs["pixel_values"]
+        grid_thw = inputs.get("image_grid_thw")
+
+        position_ids: Optional[mx.array] = None
+        if grid_thw is not None:
+            position_ids, rope_deltas = _compute_image_mrope_state(
+                input_ids, grid_thw, self.config
+            )
+            text_model.language_model.model.rope_deltas = rope_deltas
+
+        return input_ids, grid_thw, pixel_values, position_ids
+
     def compute_embeddings(
         self,
         text_model: nn.Module,
@@ -163,24 +205,31 @@ class Qwen3_5VisionAddOn(BaseVisionAddOn):
         Compute input_ids and embeddings for text with images,
         then inject MRoPE position IDs into the patched text model.
         """
-
-        result = compute_qwen_vl_embeddings(
-            addon=self,
-            text_model=text_model,
-            prompt_tokens=prompt_tokens,
-            images_b64=images_b64,
-            qwen_vl_version=3,
-            max_size=max_size,
+        input_ids, grid_thw, pixel_values, position_ids = self._prepare_inputs(
+            text_model, prompt_tokens, images_b64, max_size
         )
 
-        # Compute and inject MRoPE position IDs for vision tokens
-        if result.grid_thw is not None:
-            position_ids, rope_deltas = _compute_image_mrope_state(
-                result.input_ids,
-                result.grid_thw,
-                self.config,
-            )
-            text_model.language_model.model.position_ids = position_ids
-            text_model.language_model.model.rope_deltas = rope_deltas
+        input_embeddings = text_model.language_model.model.embed_tokens(input_ids[None])
 
-        return result.input_ids, result.embeddings
+        if pixel_values is None:
+            return input_ids, input_embeddings.squeeze(0)
+
+        if pixel_values.dtype != input_embeddings.dtype:
+            pixel_values = pixel_values.astype(input_embeddings.dtype)
+
+        hidden_states, _ = self.vision_tower(
+            pixel_values, grid_thw, output_hidden_states=False
+        )
+        final_inputs_embeds, _ = self.model_cls.merge_input_ids_with_image_features(
+            hidden_states,
+            input_embeddings,
+            input_ids[None],
+            self.config.image_token_id,
+            self.config.video_token_id,
+        )
+
+        # Set full MRoPE state: rope_deltas already set by _prepare_inputs, add position_ids.
+        if position_ids is not None:
+            text_model.language_model.model.position_ids = position_ids
+
+        return input_ids, final_inputs_embeds.squeeze(0)

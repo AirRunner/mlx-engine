@@ -2,7 +2,7 @@ import json
 from typing import Optional, List, Tuple
 import mlx_lm
 from mlx_lm.tokenizer_utils import TokenizerWrapper, StreamingDetokenizer
-from mlx_engine.cache_wrapper import CacheWrapper
+from mlx_engine.cache_wrapper import CacheWrapper, ImageCheckpointStore
 from pathlib import Path
 import mlx.nn as nn
 import mlx.core as mx
@@ -118,6 +118,7 @@ class ModelKit:
         )
         if should_load_vision_add_on:
             self.vision_add_on = vision_add_on_class(model_path)
+            self.cache_wrapper._image_store = ImageCheckpointStore()
         logger.info("Model loaded successfully")
 
     def __init__(

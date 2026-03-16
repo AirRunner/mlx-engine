@@ -1,4 +1,7 @@
+import copy
+import hashlib
 from contextlib import contextmanager
+import mlx.core as mx
 import uuid
 from mlx_engine.model_kit.batched_model_kit import (
     BatchedGenerationResponse,
@@ -39,7 +42,12 @@ from mlx_engine.utils.speculative_decoding import (
 )
 from outlines.processors.structured import JSONLogitsProcessor
 from mlx_engine.utils.outlines_transformer_tokenizer import OutlinesTransformerTokenizer
-from mlx_engine.cache_wrapper import validate_prefill_step_size
+from mlx_engine.cache_wrapper import (
+    validate_prefill_step_size,
+    image_block_boundaries,
+    image_block_lengths,
+    ImageCheckpointStore,
+)
 from mlx_engine.utils.prompt_progress_reporter import (
     BatchedMlxLmReporterAdapter,
     LoggerReporter,
@@ -391,6 +399,188 @@ def _sequential_gen_abort_handler(
             model_kit.pending_requests.pop(request_id, None)
 
 
+def _get_image_store(model_kit) -> Optional[ImageCheckpointStore]:
+    cw = getattr(model_kit, "cache_wrapper", None)
+    return getattr(cw, "_image_store", None) if cw else None
+
+
+def _hash_images(images_b64: list) -> tuple:
+    return tuple(hashlib.sha256(img.encode()).hexdigest() for img in images_b64)
+
+
+def _prefill_modelkit_with_image_checkpoints(
+    model_kit: ModelKit,
+    input_ids: mx.array,
+    embeddings: mx.array,
+    image_boundaries: list,
+    reporter: PromptProgressReporter,
+) -> tuple:
+    """Chunked prefill saving a KV snapshot after each image block.
+
+    Args:
+        model_kit:        Loaded ModelKit instance.
+        input_ids:        Merged token ids, shape (seq_len,).
+        embeddings:       Merged embeddings, shape (seq_len, dim).
+        image_boundaries: (start, end_exclusive) pairs from image_block_boundaries.
+        reporter:         Progress reporter.
+
+    Returns:
+        (cache, block_checkpoints) where block_checkpoints is a list of
+        (image_end_index, cache_snapshot) pairs, one per image block.
+    """
+    total = input_ids.shape[0]
+    prefill_len = total - 1  # stream_generate handles the last token
+
+    snap_set = {end for _, end in image_boundaries if end <= prefill_len}
+    snap_list = sorted(snap_set)
+
+    cache = make_prompt_cache(model_kit.model)
+    block_checkpoints = []
+    chunk_size = model_kit.prefill_step_size
+
+    reporter.begin(
+        is_draft=False,
+        cached_tokens=0,
+        total_prompt_tokens=total,
+        prefill_tokens_processed=0,
+    )
+
+    processed = 0
+    i = 0
+    while i < prefill_len:
+        end = min(i + chunk_size, prefill_len)
+        for snap in snap_list:
+            if snap > i and snap <= end:
+                end = snap
+                break
+
+        chunk_ids = input_ids[i:end][None]
+        chunk_emb = embeddings[i:end][None]
+        model_kit.model(chunk_ids, cache=cache, input_embeddings=chunk_emb)
+        mx.eval([c.state for c in cache])
+        mx.clear_cache()
+        processed += end - i
+
+        if end in snap_set:
+            block_checkpoints.append((end, copy.deepcopy(cache)))
+
+        if not reporter.update(is_draft=False, prefill_tokens_processed=processed):
+            raise StopPromptProcessing
+
+        i = end
+
+    reporter.finish(is_draft=False, prefill_tokens_processed=total)
+    return cache, block_checkpoints
+
+
+def _process_modelkit_image_cache(
+    model_kit: ModelKit,
+    image_store: ImageCheckpointStore,
+    prompt_tokens,
+    images_b64: list,
+    max_image_size,
+    generate_args: dict,
+    reporter: PromptProgressReporter,
+) -> tuple:
+    """Handle image prompts with KV cache for ModelKit (Qwen3.5 dense and MoE).
+
+    On full cache hit: skips the vision tower, restores the KV snapshot, and
+    prefills only the text suffix that follows the last image block.
+    On miss: runs the full vision tower, prefills with per-image checkpoints,
+    and persists them for subsequent turns.
+
+    Sets generate_args["prompt_cache"] in both paths.
+    Returns (input_tokens, input_embeddings) for stream_generate.
+    """
+    vision_add_on = model_kit.vision_add_on
+    vision_add_on.clear_prediction_state(model_kit.model)
+    model_kit._cross_prompt_cache_active = False
+
+    # Reorder images to chronological conversation order.
+    image_hashes = list(_hash_images(images_b64))
+    images_b64, image_hashes = image_store.reorder_images_chronologically(
+        images_b64, image_hashes
+    )
+    hash_chain = tuple(image_hashes)
+
+    # Cheap CPU step: tokenize + resize, no ViT. Sets rope_deltas on text_model.
+    input_ids, _, _, position_ids = vision_add_on._prepare_inputs(
+        model_kit.model, prompt_tokens, images_b64, max_image_size
+    )
+    input_ids_list = input_ids.tolist()
+    vid_tok = getattr(vision_add_on.config, "video_token_id", None)
+    block_lengths = image_block_lengths(
+        input_ids_list, vision_add_on.config.image_token_id, vid_tok
+    )
+
+    # Invalidate stale checkpoints (prefix hash mismatch or block length change).
+    for depth in range(len(hash_chain), 0, -1):
+        key = hash_chain[:depth]
+        if image_store.validate_image_checkpoint(
+            key,
+            input_ids_list,
+            vision_add_on.config.image_token_id,
+            vid_tok,
+            block_lengths,
+        ):
+            image_store.invalidate_image_checkpoint(key)
+
+    hit = image_store.find_deepest_image_checkpoint(hash_chain)
+    is_full_hit = hit is not None and hit[0] == hash_chain
+
+    if is_full_hit:
+        _, cache_snapshot, image_end_index = hit
+        cache = copy.deepcopy(cache_snapshot)
+
+        # Restore full MRoPE state so suffix tokens use the original stored positions.
+        # rope_deltas was already set by _prepare_inputs; position_ids completes it.
+        if position_ids is not None:
+            model_kit.model.language_model.model.position_ids = position_ids
+
+        suffix = input_ids_list[image_end_index:-1]
+        reporter.begin(
+            is_draft=False,
+            cached_tokens=image_end_index,
+            total_prompt_tokens=len(input_ids_list),
+            prefill_tokens_processed=0,
+        )
+        if suffix:
+            suffix_array = mx.array(suffix)[None]
+            for start in range(0, len(suffix), model_kit.prefill_step_size):
+                end = min(start + model_kit.prefill_step_size, len(suffix))
+                model_kit.model(suffix_array[:, start:end], cache=cache)
+                mx.eval([c.state for c in cache])
+                mx.clear_cache()
+                if not reporter.update(is_draft=False, prefill_tokens_processed=end):
+                    raise StopPromptProcessing
+        reporter.finish(is_draft=False, prefill_tokens_processed=len(suffix) + 1)
+
+        generate_args["prompt_cache"] = cache
+        logger.info(
+            f"[kv-image] cache hit depth={len(hash_chain)}"
+            f" cached={image_end_index}/{len(input_ids_list)} tokens"
+        )
+        return input_ids[-1:], None
+
+    # Miss path: run the full vision tower, then chunked prefill with snapshots.
+    # compute_embeddings calls _prepare_inputs again (cheap) and sets position_ids.
+    input_ids, embeddings = vision_add_on.compute_embeddings(
+        model_kit.model, prompt_tokens, images_b64, max_image_size
+    )
+    image_boundaries = image_block_boundaries(
+        input_ids.tolist(), vision_add_on.config.image_token_id, vid_tok
+    )
+    cache, block_checkpoints = _prefill_modelkit_with_image_checkpoints(
+        model_kit, input_ids, embeddings, image_boundaries, reporter
+    )
+    image_store.save_block_checkpoints(
+        hash_chain, 0, block_checkpoints, input_ids.tolist(), block_lengths
+    )
+
+    generate_args["prompt_cache"] = cache
+    return input_ids[-1:], embeddings[-1:]
+
+
 def _sequential_generation(
     model_kit: ModelKit | VisionModelKit,
     prompt_tokens: List[int],
@@ -451,15 +641,29 @@ def _sequential_generation(
         )
 
         # Process prompt
+        image_store = _get_image_store(model_kit)
+        image_cache_prefill_done = False
         try:
-            input_tokens, input_embeddings = model_kit.process_prompt(
-                prompt_tokens,
-                images_b64,
-                prompt_progress_reporter,
-                generate_args,
-                max_image_size,
-                speculative_decoding_toggle,
-            )
+            if images_b64 and image_store is not None:
+                input_tokens, input_embeddings = _process_modelkit_image_cache(
+                    model_kit,
+                    image_store,
+                    prompt_tokens,
+                    images_b64,
+                    max_image_size,
+                    generate_args,
+                    prompt_progress_reporter,
+                )
+                image_cache_prefill_done = True
+            else:
+                input_tokens, input_embeddings = model_kit.process_prompt(
+                    prompt_tokens,
+                    images_b64,
+                    prompt_progress_reporter,
+                    generate_args,
+                    max_image_size,
+                    speculative_decoding_toggle,
+                )
         except StopPromptProcessing:
             yield construct_user_cancelled_result()
             return
@@ -516,15 +720,15 @@ def _sequential_generation(
         stop_string_processor = create_stop_string_processor(stop_strings, tokenizer)
         text = ""
 
-        # Determine callback for mlx-lm based on processing mode
-        # When cache is NOT active (vision prompts), stream_generate handles prompt processing
-        # When cache IS active (text-only), cache_wrapper already handled it
-        if not model_kit.is_cross_prompt_cache_active():
+        # Determine callback for mlx-lm based on processing mode.
+        # image_cache_prefill_done: prefill already handled + reporter.finish called.
+        # is_cross_prompt_cache_active: CacheWrapper LRU handled reporting.
+        if image_cache_prefill_done or model_kit.is_cross_prompt_cache_active():
+            mlx_lm_callback = None
+        else:
             mlx_lm_callback = MlxLmReporterAdapter(
                 prompt_progress_reporter, emit_begin=True
             )
-        else:
-            mlx_lm_callback = None
 
         stream = stream_generate(
             model=model_kit.model,
@@ -550,6 +754,7 @@ def _sequential_generation(
             # Token processor
             token = generation_result.token
             text += generation_result.text
+
             # record generated token to cache, if cache is active
             if model_kit.is_cross_prompt_cache_active():
                 model_kit.record_token_to_cache(token)
