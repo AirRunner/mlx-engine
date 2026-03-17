@@ -1,3 +1,5 @@
+import copy
+import hashlib
 from contextlib import contextmanager
 import uuid
 from mlx_engine.model_kit.batched_model_kit import (
@@ -62,6 +64,14 @@ MAX_TOP_LOGPROBS = 10
 
 
 logger = logging.getLogger(__name__)
+
+
+def _compute_image_hash(images_b64: List[str]) -> str:
+    """SHA-256 of the concatenated base64 image data, used as a stable cross-turn cache key."""
+    h = hashlib.sha256()
+    for img in images_b64:
+        h.update(img.encode())
+    return h.hexdigest()
 
 
 def _handle_stop_string_detected(
@@ -439,11 +449,21 @@ def _sequential_generation(
             model_kit, draft_model, num_draft_tokens, generate_args
         )
 
-        # Image requests invalidate any cached text-only KV state: the vision branch
-        # builds a fresh prompt cache internally. Drop the LRU snapshot now to free
-        # memory before the image is processed.
+        # Image KV cache: check whether the same image was seen on a previous turn.
+        # On a hit, the KV snapshot taken right after image-token prefill is restored
+        # and only the new text tokens need processing.
+        # On a miss, the text-only LRU is cleared (stale after an image turn) and
+        # the image checkpoint is saved after the first token is generated.
+        image_hash: str | None = None
+        is_image_cache_hit = False
         if images_b64 and isinstance(model_kit, VisionModelKit):
-            model_kit.cache_wrapper.clear()
+            image_hash = _compute_image_hash(images_b64)
+            if model_kit.cache_wrapper.get_image_checkpoint(image_hash) is not None:
+                is_image_cache_hit = True
+                logger.info(f"[kv-image] cache hit hash={image_hash[:8]}…")
+            else:
+                # Drop stale text-only snapshots before the expensive image prefill.
+                model_kit.cache_wrapper.clear_text()
 
         # Process prompt
         try:
@@ -461,6 +481,35 @@ def _sequential_generation(
         if draft_model is None:
             # input embeddings not yet supported for speculative decoding in mlx-lm
             generate_args["input_embeddings"] = input_embeddings
+
+        # Image cache hit: restore KV snapshot and prefill only the new text tokens.
+        if is_image_cache_hit:
+            cache_snapshot, image_end_index = (
+                model_kit.cache_wrapper.get_image_checkpoint(image_hash)
+            )
+            base_cache = copy.deepcopy(cache_snapshot)
+
+            # Text tokens after the image block in VLM input_ids space
+            vlm_text_tokens = model_kit.model.input_ids[:, image_end_index:]
+
+            try:
+                base_cache, last_token = (
+                    model_kit.cache_wrapper.prefill_text_after_image(
+                        base_cache, vlm_text_tokens, prompt_progress_reporter
+                    )
+                )
+            except StopPromptProcessing:
+                yield construct_user_cancelled_result()
+                return
+
+            # Inject the pre-filled cache into VisionModelWrapper and mark the image
+            # prefill as already done so that __call__ goes to the decode path.
+            model_kit.model.language_model_kwargs = {"cache": base_cache}
+            model_kit.model.first_call = True
+            model_kit.model.pixel_values = None
+
+            input_tokens = last_token
+            generate_args.pop("input_embeddings", None)
 
         # VisionCacheWrapper: LRU prefix caching for text-only VisionModelKit requests.
         # Uses prompt_tokens (LM Studio's stable tokenisation) as the LRU key — not
@@ -513,6 +562,7 @@ def _sequential_generation(
         # Keep track of tokens buffered by detokenizer to yield accurate generation results
         token_buffer: List[Token] = []
         top_logprobs_buffer: List[List[Token]] = []
+        _image_checkpoint_saved = False
 
         tokenizer = model_kit.tokenizer
 
@@ -566,6 +616,23 @@ def _sequential_generation(
             # Token processor
             token = generation_result.token
             text += generation_result.text
+
+            # Save image KV checkpoint after the first token (miss path only).
+            # At this point VisionModelWrapper.__call__ has completed its image
+            # prefill and populated image_kv_checkpoint / image_end_index.
+            if (
+                not _image_checkpoint_saved
+                and image_hash is not None
+                and not is_image_cache_hit
+            ):
+                _image_checkpoint_saved = True
+                checkpoint = model_kit.model.image_kv_checkpoint
+                idx = model_kit.model.image_end_index
+                if checkpoint is not None and idx is not None:
+                    model_kit.cache_wrapper.save_image_checkpoint(
+                        image_hash, checkpoint, idx
+                    )
+
             # record generated token to cache, if cache is active
             if model_kit.is_cross_prompt_cache_active():
                 model_kit.record_token_to_cache(token)
