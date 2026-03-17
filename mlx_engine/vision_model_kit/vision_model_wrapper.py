@@ -10,8 +10,35 @@ from mlx_engine.cache_wrapper import PROMPT_PROCESSING_CHUNK_SIZE
 from mlx_engine.model_kit.vision_add_ons.process_prompt_with_images import (
     common_process_prompt_with_images,
 )
+from mlx_engine.utils.prompt_progress_reporter import (
+    PromptProgressReporter,
+    StopPromptProcessing,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _find_image_blocks(flat_ids, img_tok, vid_tok):
+    """Return list of (start, end) for each contiguous image-token block."""
+    blocks = []
+    in_block = False
+    start = 0
+    for i, tok in enumerate(flat_ids):
+        is_vis = tok == img_tok or tok == vid_tok
+        if is_vis and not in_block:
+            in_block = True
+            start = i
+        elif not is_vis and in_block:
+            blocks.append((start, i))
+            in_block = False
+    if in_block:
+        blocks.append((start, len(flat_ids)))
+    return blocks
+
+
+def _find_image_block_ends(flat_ids, img_tok, vid_tok):
+    """Return the end position (exclusive) of each contiguous image-token block."""
+    return [end for _, end in _find_image_blocks(flat_ids, img_tok, vid_tok)]
 
 
 class VisionModelWrapper:
@@ -40,6 +67,8 @@ class VisionModelWrapper:
             # set during image prefill; read by VisionCacheWrapper for cross-turn KV reuse
             "image_end_index": None,
             "image_kv_checkpoint": None,
+            # one (end_idx, cache_snapshot) entry per image block, in order
+            "image_block_checkpoints": [],
         }
 
     def __getattr__(self, name):
@@ -122,22 +151,41 @@ class VisionModelWrapper:
                 # Split prefill at image_end_index so we can checkpoint the KV cache
                 # right after the image tokens — enabling cross-turn image KV reuse.
 
-                # Phase 1: image tokens [0, image_end_index) in chunks
-                for start in range(0, image_end_index, PROMPT_PROCESSING_CHUNK_SIZE):
-                    end = min(start + PROMPT_PROCESSING_CHUNK_SIZE, image_end_index)
-                    self.language_model(
-                        input_ids[:, start:end],
-                        inputs_embeds=inputs_embeds[:, start:end],
-                        cache=cache,
+                # Find per-image block boundaries for incremental multi-image caching.
+                try:
+                    img_tok = self.vision_model.config.image_token_index
+                    vid_tok = getattr(
+                        self.vision_model.config, "video_token_index", img_tok
                     )
-                    mx.eval([c.state for c in cache])
-                    mx.clear_cache()
+                    block_ends = _find_image_block_ends(
+                        input_ids[0].tolist(), img_tok, vid_tok
+                    )
+                except AttributeError:
+                    block_ends = []
+                if not block_ends or block_ends[-1] != image_end_index:
+                    block_ends = [image_end_index]
 
-                # Checkpoint: KV state covers exactly the image tokens.
-                # VisionCacheWrapper reads image_kv_checkpoint to restore this state
-                # on the next turn when the same image is resubmitted.
+                # Phase 1: process each image block and checkpoint after each one.
+                # This enables VisionCacheWrapper to restore KV state at any image
+                # boundary, so only new images need re-processing on the next turn.
+                block_checkpoints = []
+                prev = 0
+                for block_end in block_ends:
+                    for start in range(prev, block_end, PROMPT_PROCESSING_CHUNK_SIZE):
+                        end = min(start + PROMPT_PROCESSING_CHUNK_SIZE, block_end)
+                        self.language_model(
+                            input_ids[:, start:end],
+                            inputs_embeds=inputs_embeds[:, start:end],
+                            cache=cache,
+                        )
+                        mx.eval([c.state for c in cache])
+                        mx.clear_cache()
+                    block_checkpoints.append((block_end, copy.deepcopy(cache)))
+                    prev = block_end
+
+                self.image_block_checkpoints = block_checkpoints
                 self.image_end_index = image_end_index
-                self.image_kv_checkpoint = copy.deepcopy(cache)
+                self.image_kv_checkpoint = block_checkpoints[-1][1]
 
                 # Phase 2: text tokens [image_end_index, total-1) in chunks
                 for start in range(
@@ -164,6 +212,7 @@ class VisionModelWrapper:
                 # Chunk the prefill to bound peak VRAM.
                 self.image_end_index = None
                 self.image_kv_checkpoint = None
+                self.image_block_checkpoints = []
                 for start in range(0, total - 1, PROMPT_PROCESSING_CHUNK_SIZE):
                     end = min(start + PROMPT_PROCESSING_CHUNK_SIZE, total - 1)
                     self.language_model(
@@ -182,6 +231,7 @@ class VisionModelWrapper:
                 # Models with per-chunk kwargs use a single pass; chunking is not applicable.
                 self.image_end_index = None
                 self.image_kv_checkpoint = None
+                self.image_block_checkpoints = []
                 outputs = self.language_model(
                     self.input_ids,
                     inputs_embeds=inputs_embeds,
@@ -312,6 +362,126 @@ class VisionModelWrapper:
             self.mask = processed.attention_mask
             self.model_inputs = processed.other_inputs
 
+    def prefill_with_partial_cache(
+        self,
+        partial_depth: int,
+        base_cache,
+        reporter: PromptProgressReporter,
+    ) -> tuple:
+        """
+        Run the vision tower only for images[partial_depth:] and prefill the suffix.
+
+        Args:
+            partial_depth: Number of images whose KV is already in base_cache.
+            base_cache:    Deep-copied KV snapshot at partial_depth (will be mutated).
+            reporter:      Progress reporter for prefill UI feedback.
+
+        Returns:
+            (base_cache, last_token, new_block_checkpoints) where base_cache has been
+            filled with all tokens after the partial checkpoint, last_token (shape (1,))
+            is the final input token for stream_generate, and new_block_checkpoints is
+            a list of (end_idx, cache_snapshot) for each newly processed image block.
+
+        Raises:
+            ValueError: if prerequisites are not available.
+            StopPromptProcessing: if the user cancels during prefill.
+        """
+        if not hasattr(self.vision_model, "get_partial_input_embeddings"):
+            raise NotImplementedError(
+                f"{type(self.vision_model).__name__} does not support partial image KV "
+                "caching. Implement get_partial_input_embeddings() to enable this feature."
+            )
+
+        input_ids = self.input_ids  # (1, T)
+        total = input_ids.shape[1]
+        img_tok = self.vision_model.config.image_token_index
+        vid_tok = getattr(self.vision_model.config, "video_token_index", img_tok)
+
+        blocks = _find_image_blocks(input_ids[0].tolist(), img_tok, vid_tok)
+        if not blocks or partial_depth >= len(blocks):
+            raise ValueError(
+                f"partial_depth {partial_depth} is out of range for {len(blocks)} image blocks"
+            )
+
+        inputs_embeds = self.vision_model.get_partial_input_embeddings(
+            input_ids=input_ids,
+            pixel_values=self.pixel_values,
+            mask=self.mask,
+            model_inputs=self.model_inputs,
+            partial_depth=partial_depth,
+        )
+        mx.eval(inputs_embeds)
+        mx.clear_cache()
+
+        # Prefill suffix: from end of last cached image block to end of sequence
+        start_pos = blocks[partial_depth - 1][1]
+        image_end = blocks[-1][1]
+        processed = 0
+
+        reporter.begin(
+            is_draft=False,
+            cached_tokens=start_pos,
+            total_prompt_tokens=total,
+            prefill_tokens_processed=0,
+        )
+
+        new_block_checkpoints = []
+        prev = start_pos
+
+        # Process each new image block (and preceding text) with per-block checkpoints
+        for block_start, block_end in blocks[partial_depth:]:
+            # Text between prev and this image block
+            for s in range(prev, block_start, PROMPT_PROCESSING_CHUNK_SIZE):
+                e = min(s + PROMPT_PROCESSING_CHUNK_SIZE, block_start)
+                self.language_model(
+                    input_ids[:, s:e],
+                    inputs_embeds=inputs_embeds[:, s:e],
+                    cache=base_cache,
+                )
+                mx.eval([c.state for c in base_cache])
+                mx.clear_cache()
+                processed += e - s
+                if not reporter.update(
+                    is_draft=False, prefill_tokens_processed=processed
+                ):
+                    raise StopPromptProcessing
+            # Image block
+            for s in range(block_start, block_end, PROMPT_PROCESSING_CHUNK_SIZE):
+                e = min(s + PROMPT_PROCESSING_CHUNK_SIZE, block_end)
+                self.language_model(
+                    input_ids[:, s:e],
+                    inputs_embeds=inputs_embeds[:, s:e],
+                    cache=base_cache,
+                )
+                mx.eval([c.state for c in base_cache])
+                mx.clear_cache()
+                processed += e - s
+                if not reporter.update(
+                    is_draft=False, prefill_tokens_processed=processed
+                ):
+                    raise StopPromptProcessing
+            new_block_checkpoints.append((block_end, copy.deepcopy(base_cache)))
+            prev = block_end
+
+        # Text after all images, excluding the last token
+        for s in range(image_end, total - 1, PROMPT_PROCESSING_CHUNK_SIZE):
+            e = min(s + PROMPT_PROCESSING_CHUNK_SIZE, total - 1)
+            self.language_model(
+                input_ids[:, s:e],
+                inputs_embeds=inputs_embeds[:, s:e],
+                cache=base_cache,
+            )
+            mx.eval([c.state for c in base_cache])
+            mx.clear_cache()
+            processed += e - s
+            if not reporter.update(is_draft=False, prefill_tokens_processed=processed):
+                raise StopPromptProcessing
+
+        reporter.finish(is_draft=False, prefill_tokens_processed=processed)
+
+        last_token = input_ids[0, -1:]  # shape (1,)
+        return base_cache, last_token, new_block_checkpoints
+
     def reset(self) -> None:
         """
         Reset per-request generation state without reloading model weights.
@@ -331,6 +501,7 @@ class VisionModelWrapper:
                 "model_inputs": {},
                 "image_end_index": None,
                 "image_kv_checkpoint": None,
+                "image_block_checkpoints": [],
             }
         )
 

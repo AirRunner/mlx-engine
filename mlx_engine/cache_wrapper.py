@@ -377,10 +377,11 @@ class VisionCacheWrapper:
 
     Image layer (self._image_checkpoints)
     --------------------------------------
-    Stores KV snapshots taken immediately after image-token prefill, keyed by
-    a SHA-256 hash of the raw image data.  On the next turn that submits the
-    same image, the snapshot is restored and only the new text tokens are
-    processed, skipping full image re-prefill.
+    Stores KV snapshots taken right after each image block during prefill,
+    keyed by a tuple of per-image SHA-256 hashes: (hash(img1),),
+    (hash(img1), hash(img2)), etc.  On the next turn, the deepest matching
+    prefix is restored and only the new text tokens are prefilled, skipping
+    the vision tower entirely.
 
     Requires the mlx-vlm model to expose image_end_index via
     InputEmbeddingsFeatures.
@@ -401,7 +402,7 @@ class VisionCacheWrapper:
                        think_start_id to compute the checkpoint offset.
         """
         self._lru: LRUPromptCache = LRUPromptCache()
-        # image_hash (str) → (cache_snapshot, image_end_index: int)
+        # tuple[str, ...] → (cache_snapshot, image_end_index: int)
         self._image_checkpoints: dict = {}
         self._model = model
         self._tokenizer = tokenizer
@@ -425,26 +426,39 @@ class VisionCacheWrapper:
         mx.clear_cache()
 
     def save_image_checkpoint(
-        self, image_hash: str, cache_snapshot, image_end_index: int
+        self, key: tuple, cache_snapshot, image_end_index: int
     ) -> None:
         """
-        Persist a KV snapshot taken right after image-token prefill.
+        Persist a KV snapshot taken right after an image block.
 
         Args:
-            image_hash:      SHA-256 hex digest of the raw image bytes.
+            key:             Tuple of per-image SHA-256 hex digests up to and
+                             including this block, e.g. (hash1,) or (hash1, hash2).
             cache_snapshot:  Deep-copied KV cache list from VisionModelWrapper.
-            image_end_index: First text-token index in VLM input_ids space.
+            image_end_index: First text-token index after this image block.
         """
-        self._image_checkpoints[image_hash] = (cache_snapshot, image_end_index)
+        self._image_checkpoints[key] = (cache_snapshot, image_end_index)
         logger.info(
-            f"[kv-image] checkpoint saved hash={image_hash[:8]}… index={image_end_index}"
+            f"[kv-image] checkpoint saved depth={len(key)} index={image_end_index}"
         )
 
-    def get_image_checkpoint(self, image_hash: str):
+    def get_image_checkpoint(self, key: tuple):
         """
-        Return (cache_snapshot, image_end_index) for *image_hash*, or None.
+        Return (cache_snapshot, image_end_index) for *key*, or None.
         """
-        return self._image_checkpoints.get(image_hash)
+        return self._image_checkpoints.get(key)
+
+    def find_deepest_image_checkpoint(self, hash_chain: tuple):
+        """
+        Return (key, cache_snapshot, image_end_index) for the longest prefix of
+        *hash_chain* that has a stored checkpoint, or None if no prefix matches.
+        """
+        for depth in range(len(hash_chain), 0, -1):
+            key = hash_chain[:depth]
+            entry = self._image_checkpoints.get(key)
+            if entry is not None:
+                return key, entry[0], entry[1]
+        return None
 
     def prefill_text_after_image(
         self,
