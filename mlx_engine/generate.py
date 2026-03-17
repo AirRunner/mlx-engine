@@ -66,12 +66,9 @@ MAX_TOP_LOGPROBS = 10
 logger = logging.getLogger(__name__)
 
 
-def _compute_image_hash(images_b64: List[str]) -> str:
-    """SHA-256 of the concatenated base64 image data, used as a stable cross-turn cache key."""
-    h = hashlib.sha256()
-    for img in images_b64:
-        h.update(img.encode())
-    return h.hexdigest()
+def _compute_image_hash(image_b64: str) -> str:
+    """SHA-256 of a single base64 image, used as a per-image cache key component."""
+    return hashlib.sha256(image_b64.encode()).hexdigest()
 
 
 def _handle_stop_string_detected(
@@ -449,18 +446,34 @@ def _sequential_generation(
             model_kit, draft_model, num_draft_tokens, generate_args
         )
 
-        # Image KV cache: check whether the same image was seen on a previous turn.
-        # On a hit, the KV snapshot taken right after image-token prefill is restored
-        # and only the new text tokens need processing.
-        # On a miss, the text-only LRU is cleared (stale after an image turn) and
-        # the image checkpoint is saved after the first token is generated.
-        image_hash: str | None = None
+        # Image KV cache: check whether all images in this turn were seen before.
+        # Build a hash chain (one hash per image) and look for the deepest matching
+        # prefix in the checkpoint store.  A full match skips the vision tower
+        # entirely; a partial match re-uses cached image KV and runs vision tower only
+        # for new images; a miss clears the text LRU and saves per-block checkpoints.
+        hash_chain: tuple | None = None
+        image_cache_key: tuple | None = None
         is_image_cache_hit = False
+        is_partial_cache_hit = False
+        partial_depth = 0
+        partial_snapshot = None
+        _image_checkpoint_saved = False
         if images_b64 and isinstance(model_kit, VisionModelKit):
-            image_hash = _compute_image_hash(images_b64)
-            if model_kit.cache_wrapper.get_image_checkpoint(image_hash) is not None:
+            hash_chain = tuple(_compute_image_hash(img) for img in images_b64)
+            result = model_kit.cache_wrapper.find_deepest_image_checkpoint(hash_chain)
+            if result is not None and result[0] == hash_chain:
+                # All images in the current turn are cached.
                 is_image_cache_hit = True
-                logger.info(f"[kv-image] cache hit hash={image_hash[:8]}…")
+                image_cache_key = hash_chain
+                logger.info(f"[kv-image] cache hit depth={len(hash_chain)}")
+            elif result is not None:
+                # Some leading images are cached — only run vision tower for new ones.
+                is_partial_cache_hit = True
+                partial_depth = len(result[0])
+                partial_snapshot = result[1]
+                logger.info(
+                    f"[kv-image] partial hit depth={partial_depth}/{len(hash_chain)}"
+                )
             else:
                 # Drop stale text-only snapshots before the expensive image prefill.
                 model_kit.cache_wrapper.clear_text()
@@ -485,7 +498,7 @@ def _sequential_generation(
         # Image cache hit: restore KV snapshot and prefill only the new text tokens.
         if is_image_cache_hit:
             cache_snapshot, image_end_index = (
-                model_kit.cache_wrapper.get_image_checkpoint(image_hash)
+                model_kit.cache_wrapper.get_image_checkpoint(image_cache_key)
             )
             base_cache = copy.deepcopy(cache_snapshot)
 
@@ -508,6 +521,33 @@ def _sequential_generation(
             model_kit.model.first_call = True
             model_kit.model.pixel_values = None
 
+            input_tokens = last_token
+            generate_args.pop("input_embeddings", None)
+
+        # Partial image cache hit: restore KV at partial_depth, run vision tower only
+        # for new images, prefill the suffix, save new per-block checkpoints.
+        if is_partial_cache_hit:
+            _image_checkpoint_saved = True
+            base_cache = copy.deepcopy(partial_snapshot)
+            try:
+                base_cache, last_token, new_block_checkpoints = (
+                    model_kit.model.prefill_with_partial_cache(
+                        partial_depth=partial_depth,
+                        base_cache=base_cache,
+                        reporter=prompt_progress_reporter,
+                    )
+                )
+            except StopPromptProcessing:
+                yield construct_user_cancelled_result()
+                return
+            # Save new per-block checkpoints so the next turn can be a full or deeper match.
+            for i, (end_idx, snap) in enumerate(new_block_checkpoints):
+                model_kit.cache_wrapper.save_image_checkpoint(
+                    hash_chain[: partial_depth + i + 1], snap, end_idx
+                )
+            model_kit.model.language_model_kwargs = {"cache": base_cache}
+            model_kit.model.first_call = True
+            model_kit.model.pixel_values = None
             input_tokens = last_token
             generate_args.pop("input_embeddings", None)
 
@@ -562,7 +602,6 @@ def _sequential_generation(
         # Keep track of tokens buffered by detokenizer to yield accurate generation results
         token_buffer: List[Token] = []
         top_logprobs_buffer: List[List[Token]] = []
-        _image_checkpoint_saved = False
 
         tokenizer = model_kit.tokenizer
 
@@ -617,20 +656,31 @@ def _sequential_generation(
             token = generation_result.token
             text += generation_result.text
 
-            # Save image KV checkpoint after the first token (miss path only).
+            # Save per-image-block KV checkpoints after the first token (miss path only).
             # At this point VisionModelWrapper.__call__ has completed its image
-            # prefill and populated image_kv_checkpoint / image_end_index.
+            # prefill and populated image_block_checkpoints / image_end_index.
             if (
                 not _image_checkpoint_saved
-                and image_hash is not None
+                and hash_chain is not None
                 and not is_image_cache_hit
+                and not is_partial_cache_hit
             ):
                 _image_checkpoint_saved = True
-                checkpoint = model_kit.model.image_kv_checkpoint
-                idx = model_kit.model.image_end_index
-                if checkpoint is not None and idx is not None:
+                block_checkpoints = model_kit.model.image_block_checkpoints
+                if block_checkpoints and len(block_checkpoints) == len(hash_chain):
+                    for i, (end_idx, snap) in enumerate(block_checkpoints):
+                        model_kit.cache_wrapper.save_image_checkpoint(
+                            hash_chain[: i + 1], snap, end_idx
+                        )
+                elif (
+                    model_kit.model.image_kv_checkpoint is not None
+                    and model_kit.model.image_end_index is not None
+                ):
+                    # Fallback: model did not expose per-block checkpoints.
                     model_kit.cache_wrapper.save_image_checkpoint(
-                        image_hash, checkpoint, idx
+                        hash_chain,
+                        model_kit.model.image_kv_checkpoint,
+                        model_kit.model.image_end_index,
                     )
 
             # record generated token to cache, if cache is active
