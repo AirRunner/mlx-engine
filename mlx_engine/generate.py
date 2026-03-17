@@ -12,7 +12,6 @@ from pathlib import Path
 import sys
 import threading
 
-import mlx.core as mx
 from mlx_engine.utils.kv_cache_quantization import get_kv_cache_quantization_params
 from mlx_lm.generate import stream_generate
 from mlx_lm.utils import load as mlx_lm_load
