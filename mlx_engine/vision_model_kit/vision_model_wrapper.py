@@ -1,9 +1,12 @@
-import mlx.core as mx
+import copy
 import logging
-
-from mlx_vlm.models.cache import make_prompt_cache
-from mlx_vlm.models.base import InputEmbeddingsFeatures
 from typing import List, Optional
+
+import mlx.core as mx
+from mlx_vlm.models.base import InputEmbeddingsFeatures
+from mlx_vlm.models.cache import make_prompt_cache
+
+from mlx_engine.cache_wrapper import PROMPT_PROCESSING_CHUNK_SIZE
 from mlx_engine.model_kit.vision_add_ons.process_prompt_with_images import (
     common_process_prompt_with_images,
 )
@@ -34,6 +37,9 @@ class VisionModelWrapper:
             "language_model_kwargs": {},
             # vision model kwargs
             "model_inputs": {},
+            # set during image prefill; read by VisionCacheWrapper for cross-turn KV reuse
+            "image_end_index": None,
+            "image_kv_checkpoint": None,
         }
 
     def __getattr__(self, name):
@@ -107,12 +113,81 @@ class VisionModelWrapper:
             if attention_mask_4d is not None:
                 lm_call_kwargs["mask"] = attention_mask_4d
 
-            outputs = self.language_model(
-                self.input_ids,
-                inputs_embeds=inputs_embeds,
-                cache=cache,
-                **lm_call_kwargs,
-            )
+            image_end_index = embedding_output.image_end_index
+            total = inputs_embeds.shape[1]
+            input_ids = self.input_ids
+
+            if len(lm_call_kwargs) == 0 and image_end_index is not None:
+                # Early-fusion model with known image boundary.
+                # Split prefill at image_end_index so we can checkpoint the KV cache
+                # right after the image tokens — enabling cross-turn image KV reuse.
+
+                # Phase 1: image tokens [0, image_end_index) in chunks
+                for start in range(0, image_end_index, PROMPT_PROCESSING_CHUNK_SIZE):
+                    end = min(start + PROMPT_PROCESSING_CHUNK_SIZE, image_end_index)
+                    self.language_model(
+                        input_ids[:, start:end],
+                        inputs_embeds=inputs_embeds[:, start:end],
+                        cache=cache,
+                    )
+                    mx.eval([c.state for c in cache])
+                    mx.clear_cache()
+
+                # Checkpoint: KV state covers exactly the image tokens.
+                # VisionCacheWrapper reads image_kv_checkpoint to restore this state
+                # on the next turn when the same image is resubmitted.
+                self.image_end_index = image_end_index
+                self.image_kv_checkpoint = copy.deepcopy(cache)
+
+                # Phase 2: text tokens [image_end_index, total-1) in chunks
+                for start in range(
+                    image_end_index, total - 1, PROMPT_PROCESSING_CHUNK_SIZE
+                ):
+                    end = min(start + PROMPT_PROCESSING_CHUNK_SIZE, total - 1)
+                    self.language_model(
+                        input_ids[:, start:end],
+                        inputs_embeds=inputs_embeds[:, start:end],
+                        cache=cache,
+                    )
+                    mx.eval([c.state for c in cache])
+                    mx.clear_cache()
+
+                # Last token is returned as the first sampled output token
+                outputs = self.language_model(
+                    input_ids[:, -1:],
+                    inputs_embeds=inputs_embeds[:, -1:],
+                    cache=cache,
+                )
+            elif len(lm_call_kwargs) == 0 and total > PROMPT_PROCESSING_CHUNK_SIZE + 1:
+                # Early-fusion model without a known image boundary
+                # (mlx-vlm model does not expose image_end_index yet).
+                # Chunk the prefill to bound peak VRAM.
+                self.image_end_index = None
+                self.image_kv_checkpoint = None
+                for start in range(0, total - 1, PROMPT_PROCESSING_CHUNK_SIZE):
+                    end = min(start + PROMPT_PROCESSING_CHUNK_SIZE, total - 1)
+                    self.language_model(
+                        input_ids[:, start:end],
+                        inputs_embeds=inputs_embeds[:, start:end],
+                        cache=cache,
+                    )
+                    mx.eval([c.state for c in cache])
+                    mx.clear_cache()
+                outputs = self.language_model(
+                    input_ids[:, -1:],
+                    inputs_embeds=inputs_embeds[:, -1:],
+                    cache=cache,
+                )
+            else:
+                # Models with per-chunk kwargs use a single pass; chunking is not applicable.
+                self.image_end_index = None
+                self.image_kv_checkpoint = None
+                outputs = self.language_model(
+                    self.input_ids,
+                    inputs_embeds=inputs_embeds,
+                    cache=cache,
+                    **lm_call_kwargs,
+                )
 
             # Persist only decode type kwargs + cache to mirror mlx-vlm's native generation loop
             # ref: https://github.com/Blaizzy/mlx-vlm/blob/1028599/mlx_vlm/generate.py#L369-L377
@@ -254,6 +329,8 @@ class VisionModelWrapper:
                 "decoder_input_ids": None,
                 "language_model_kwargs": {},
                 "model_inputs": {},
+                "image_end_index": None,
+                "image_kv_checkpoint": None,
             }
         )
 

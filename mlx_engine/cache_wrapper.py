@@ -365,45 +365,137 @@ class CacheWrapper:
 
 class VisionCacheWrapper:
     """
-    LRU-backed KV cache for VisionModelKit text-only requests.
+    LRU-backed KV cache for VisionModelKit requests.
 
+    Text layer (self._lru)
+    ----------------------
     Parallels CacheWrapper but uses a multi-slot LRU instead of a single-slot
     cache.  VisionModelWrapper's KV cache is non-trimmable (ArraysCache), so
     the trim-based prefix-reuse approach of CacheWrapper is unavailable.
     Instead, a checkpoint is saved at the end of every prefill and fetched on
     the next request, allowing arbitrarily long prefix matches across turns.
 
+    Image layer (self._image_checkpoints)
+    --------------------------------------
+    Stores KV snapshots taken immediately after image-token prefill, keyed by
+    a SHA-256 hash of the raw image data.  On the next turn that submits the
+    same image, the snapshot is restored and only the new text tokens are
+    processed, skipping full image re-prefill.
+
+    Requires the mlx-vlm model to expose image_end_index via
+    InputEmbeddingsFeatures.
+
     Lifecycle
     ---------
     - Instantiated once in VisionModelKit._full_model_init(), preserved across
       subsequent _reset_for_prediction() calls so that LRU snapshots survive.
-    - clear() must be called before image requests: the vision branch creates
-      its own internal cache, so any stored text-only snapshot is stale and
-      would waste memory during the (already expensive) image forward pass.
+    - clear_text() is called before image requests to drop stale text-only
+      snapshots.  Image checkpoints are intentionally preserved across turns.
     """
 
     def __init__(self, model, tokenizer) -> None:
         """
         Args:
-            model:     VisionModelWrapper — used for Phase 1 forward pass.
-            tokenizer: Model tokenizer — inspected for has_thinking /
+            model:     VisionModelWrapper, used for prefill forward passes.
+            tokenizer: Model tokenizer, inspected for has_thinking /
                        think_start_id to compute the checkpoint offset.
         """
         self._lru: LRUPromptCache = LRUPromptCache()
+        # image_hash (str) → (cache_snapshot, image_end_index: int)
+        self._image_checkpoints: dict = {}
         self._model = model
         self._tokenizer = tokenizer
 
-    def clear(self) -> None:
+    def clear_text(self) -> None:
         """
-        Drop all cached KV snapshots and release the associated Metal buffers.
+        Drop text-only KV snapshots and release their Metal buffers.
 
-        Call this before every image request.  The vision branch always builds
-        a fresh prompt cache internally, so any stored text-only snapshot
-        becomes stale after an image turn and would needlessly occupy memory
-        during the memory-intensive vision forward pass.
+        Call this before an image request whose image is not in the checkpoint
+        store.  Image checkpoints are intentionally left intact so that a
+        cached image can still be reused on future turns.
         """
         self._lru = LRUPromptCache()
         mx.clear_cache()
+
+    def clear(self) -> None:
+        """Drop all KV snapshots (text-only and image). Callers that only need
+        to flush text-only state should prefer clear_text()."""
+        self._lru = LRUPromptCache()
+        self._image_checkpoints = {}
+        mx.clear_cache()
+
+    def save_image_checkpoint(
+        self, image_hash: str, cache_snapshot, image_end_index: int
+    ) -> None:
+        """
+        Persist a KV snapshot taken right after image-token prefill.
+
+        Args:
+            image_hash:      SHA-256 hex digest of the raw image bytes.
+            cache_snapshot:  Deep-copied KV cache list from VisionModelWrapper.
+            image_end_index: First text-token index in VLM input_ids space.
+        """
+        self._image_checkpoints[image_hash] = (cache_snapshot, image_end_index)
+        logger.info(
+            f"[kv-image] checkpoint saved hash={image_hash[:8]}… index={image_end_index}"
+        )
+
+    def get_image_checkpoint(self, image_hash: str):
+        """
+        Return (cache_snapshot, image_end_index) for *image_hash*, or None.
+        """
+        return self._image_checkpoints.get(image_hash)
+
+    def prefill_text_after_image(
+        self,
+        base_cache,
+        vlm_text_tokens: mx.array,
+        reporter: PromptProgressReporter,
+    ) -> tuple:
+        """
+        Prefill text tokens that follow the image block, using the restored
+        image KV snapshot as the starting cache state.
+
+        Runs in PROMPT_PROCESSING_CHUNK_SIZE-token blocks with eager eval and
+        mx.clear_cache() between chunks, following the same pattern as update_cache().
+
+        Args:
+            base_cache:       Deep-copied image KV snapshot (will be mutated).
+            vlm_text_tokens:  input_ids[image_end_index:], shape (1, T).
+            reporter:         Progress reporter for prefill UI feedback.
+
+        Returns:
+            (base_cache, last_token) where base_cache has been filled with
+            vlm_text_tokens[:-1] and last_token (shape (1,)) is the single
+            token to pass as prompt to stream_generate.
+
+        Raises:
+            StopPromptProcessing: if the user cancels during prefill.
+        """
+        total = vlm_text_tokens.shape[1]
+
+        reporter.begin(
+            is_draft=False,
+            cached_tokens=0,
+            total_prompt_tokens=total,
+            prefill_tokens_processed=0,
+        )
+
+        processed = 0
+        for start in range(0, total - 1, PROMPT_PROCESSING_CHUNK_SIZE):
+            end = min(start + PROMPT_PROCESSING_CHUNK_SIZE, total - 1)
+            self._model.language_model(vlm_text_tokens[:, start:end], cache=base_cache)
+            mx.eval([c.state for c in base_cache])
+            mx.clear_cache()
+            processed += end - start
+            if not reporter.update(is_draft=False, prefill_tokens_processed=processed):
+                raise StopPromptProcessing
+
+        reporter.finish(is_draft=False, prefill_tokens_processed=processed)
+
+        # Return the last token as a 1-D array for stream_generate
+        last_token = vlm_text_tokens[0, -1:]
+        return base_cache, last_token
 
     def _checkpoint_offset(self, tokens: list) -> int:
         """
@@ -454,7 +546,6 @@ class VisionCacheWrapper:
         """
         offset = self._checkpoint_offset(prompt_tokens)
 
-        # --- LRU lookup ---
         base_cache, rest = self._lru.fetch_nearest_cache("model", prompt_tokens)
         if base_cache is None:
             base_cache = make_prompt_cache(self._model.language_model)
@@ -465,7 +556,7 @@ class VisionCacheWrapper:
                 f"[kv-seq] cache hit: {cached}/{len(prompt_tokens)} tokens cached"
             )
 
-        # --- Phase 1: prefill rest[:-offset] in chunks ---
+        # Prefill rest[:-offset] in chunks
         phase1_len = len(rest) - offset
         cached_tokens = len(prompt_tokens) - len(rest)
 
@@ -494,7 +585,6 @@ class VisionCacheWrapper:
             prefill_tokens_processed=cached_tokens + phase1_len,
         )
 
-        # --- Checkpoint ---
         checkpoint_key = prompt_tokens[:-offset]
         self._lru.insert_cache(
             "model", checkpoint_key, copy.deepcopy(base_cache), checkpoint=True
