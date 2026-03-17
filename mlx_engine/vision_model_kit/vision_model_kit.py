@@ -1,19 +1,22 @@
-from typing import Union, Optional, List, Tuple
+import logging
+import threading
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
+
+import mlx.core as mx
+import mlx_lm
+import mlx_vlm
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
+
+from mlx_engine.cache_wrapper import VisionCacheWrapper
 from mlx_engine.model_kit.model_kit import ModelKit
 from mlx_engine.utils.prompt_progress_reporter import PromptProgressReporter
-import logging
 
 from ._transformers_compatibility import (
     fix_qwen2_5_vl_image_processor,
     fix_qwen2_vl_preprocessor,
 )
 from .vision_model_wrapper import VisionModelWrapper
-import mlx_vlm
-import mlx_lm
-from pathlib import Path
-import mlx.core as mx
-from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
-import threading
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +94,16 @@ class VisionModelKit(ModelKit):
         )
         self.detokenizer = self.tokenizer.detokenizer
 
-        self.cache_wrapper = None
+        # Preserve LRU snapshots across resets: KV tensors are Metal buffers that
+        # remain valid as long as the model weights are unchanged.  On the first
+        # load cache_wrapper does not exist yet, so we create a fresh one.
+        prior = getattr(self, "cache_wrapper", None)
+        if prior is not None:
+            prior._model = self.model
+            prior._tokenizer = self.tokenizer
+            self.cache_wrapper = prior
+        else:
+            self.cache_wrapper = VisionCacheWrapper(self.model, self.tokenizer)
         mx.clear_cache()
 
     def _initializer(self):
@@ -101,9 +113,8 @@ class VisionModelKit(ModelKit):
             self._full_model_init()
 
     def _reset_for_prediction(self):
-        # It's a shortcoming that the only way to reset the model for prediction
-        # is to reload it. Worth investigating how to make resetting faster
-        self._full_model_init()
+        self.model.reset()
+        mx.clear_cache()
 
     def process_prompt(
         self,

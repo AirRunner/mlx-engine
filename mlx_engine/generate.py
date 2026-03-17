@@ -1,5 +1,4 @@
 from contextlib import contextmanager
-import copy
 import uuid
 from mlx_engine.model_kit.batched_model_kit import (
     BatchedGenerationResponse,
@@ -18,7 +17,6 @@ from mlx_engine.utils.kv_cache_quantization import get_kv_cache_quantization_par
 from mlx_lm.generate import stream_generate
 from mlx_lm.utils import load as mlx_lm_load
 from mlx_lm.models.cache import make_prompt_cache
-from mlx_lm.server import LRUPromptCache
 
 from mlx_engine.model_kit.model_kit import ModelKit
 from mlx_engine.vision_model_kit.vision_model_kit import VisionModelKit
@@ -65,16 +63,6 @@ MAX_TOP_LOGPROBS = 10
 
 
 logger = logging.getLogger(__name__)
-
-# Per-model LRU checkpoint cache for sequential (VisionModelKit) text-only requests
-_seq_lru_caches: dict = {}
-
-
-def _get_seq_lru(model_kit) -> LRUPromptCache:
-    kit_id = id(model_kit)
-    if kit_id not in _seq_lru_caches:
-        _seq_lru_caches[kit_id] = LRUPromptCache()
-    return _seq_lru_caches[kit_id]
 
 
 def _handle_stop_string_detected(
@@ -452,15 +440,11 @@ def _sequential_generation(
             model_kit, draft_model, num_draft_tokens, generate_args
         )
 
-        # Image requests invalidate any cached KV state (the vision branch creates a fresh
-        # prompt cache internally). Clear the LRU snapshot now to free memory before the
-        # image is processed — otherwise the deepcopy snapshot + model weights + vision
-        # processing can exceed available unified memory.
+        # Image requests invalidate any cached text-only KV state: the vision branch
+        # builds a fresh prompt cache internally. Drop the LRU snapshot now to free
+        # memory before the image is processed.
         if images_b64 and isinstance(model_kit, VisionModelKit):
-            kit_id = id(model_kit)
-            if kit_id in _seq_lru_caches:
-                del _seq_lru_caches[kit_id]
-                mx.clear_cache()
+            model_kit.cache_wrapper.clear()
 
         # Process prompt
         try:
@@ -479,78 +463,24 @@ def _sequential_generation(
             # input embeddings not yet supported for speculative decoding in mlx-lm
             generate_args["input_embeddings"] = input_embeddings
 
-        # LRU checkpoint cache for VisionModelKit text-only requests.
-        # Saves a checkpoint at prompt[:-checkpoint_offset] during each prefill so that
-        # the next request can skip already-processed tokens (even for non-trimmable caches).
+        # VisionCacheWrapper: LRU prefix caching for text-only VisionModelKit requests.
+        # Uses prompt_tokens (LM Studio's stable tokenisation) as the LRU key — not
+        # input_tokens (VLM processor re-encodes inconsistently across turns).
         is_text_only_vlm = (
             isinstance(model_kit, VisionModelKit)
             and not images_b64
             and input_embeddings is None
         )
         if is_text_only_vlm:
-            seq_lru = _get_seq_lru(model_kit)
-            # Use the original prompt_tokens (from LM Studio's tokenizer) as the LRU key.
-            # input_tokens comes from VisionModelKit's processor which re-applies the chat
-            # template producing inconsistent token counts across turns (4003→3986→4202),
-            # causing cache misses. prompt_tokens is stable across turns for the same prefix.
-            seq_lru_key = list(prompt_tokens)
-            # Override input_tokens so phase 1/2 model calls use the same tokens as
-            # the LRU key — otherwise the KV cache corresponds to different tokens than the key.
-            input_tokens = mx.array(seq_lru_key)
-
-            # Compute checkpoint offset: save just before <think> token if thinking model
-            checkpoint_offset = 1
-            if getattr(model_kit.tokenizer, "has_thinking", False):
-                for i in range(1, min(11, len(seq_lru_key))):
-                    if seq_lru_key[-i] == model_kit.tokenizer.think_start_id:
-                        checkpoint_offset = i + 1
-                        break
-
-            # Fetch nearest cached prefix from LRU
-            base_cache, rest = seq_lru.fetch_nearest_cache("model", seq_lru_key)
-            if base_cache is None:
-                base_cache = make_prompt_cache(model_kit.language_model)
-                rest = seq_lru_key
-            else:
-                logger.info(
-                    f"[kv-seq] cache hit: {len(seq_lru_key) - len(rest)}/{len(seq_lru_key)} tokens cached"
+            try:
+                base_cache, rest_tokens = model_kit.cache_wrapper.update_cache(
+                    list(prompt_tokens), prompt_progress_reporter
                 )
-
-            # Phase 1: manually prefill rest[:-checkpoint_offset] to reach checkpoint position
-            phase1_len = len(rest) - checkpoint_offset
-            cached_tokens = len(seq_lru_key) - len(rest)
-            prompt_progress_reporter.begin(
-                is_draft=False,
-                cached_tokens=cached_tokens,
-                total_prompt_tokens=len(seq_lru_key),
-                prefill_tokens_processed=0,
-            )
-            processed = 0
-            if phase1_len > 0:
-                phase1_array = mx.array(rest[:phase1_len])
-                for i in range(0, phase1_len, PROMPT_PROCESSING_CHUNK_SIZE):
-                    chunk = phase1_array[i : i + PROMPT_PROCESSING_CHUNK_SIZE][None]
-                    model_kit.model(chunk, cache=base_cache)
-                    mx.eval([c.state for c in base_cache])
-                    mx.clear_cache()
-                    processed += chunk.shape[1]
-                    should_continue = prompt_progress_reporter.update(
-                        is_draft=False, prefill_tokens_processed=cached_tokens + processed
-                    )
-                    if not should_continue:
-                        raise StopPromptProcessing
-            prompt_progress_reporter.finish(
-                is_draft=False, prefill_tokens_processed=cached_tokens + phase1_len
-            )
-
-            # Save checkpoint (deep copy before stream_generate mutates base_cache further)
-            checkpoint_key = seq_lru_key[:-checkpoint_offset]
-            seq_lru.insert_cache("model", checkpoint_key, copy.deepcopy(base_cache), checkpoint=True)
-            logger.info(f"[kv-seq] checkpoint saved at len={len(checkpoint_key)}")
-
-            # Phase 2: stream_generate handles only the last checkpoint_offset tokens
+            except StopPromptProcessing:
+                yield construct_user_cancelled_result()
+                return
             generate_args["prompt_cache"] = base_cache
-            input_tokens = mx.array(rest[-checkpoint_offset:])
+            input_tokens = rest_tokens
 
         # Setup logits processors
         logits_processors = setup_logits_processors(

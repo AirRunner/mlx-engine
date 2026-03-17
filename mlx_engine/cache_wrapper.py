@@ -1,14 +1,18 @@
-from typing import List, Optional, Any
+import copy
 import logging
-from mlx_lm.models.cache import (
-    make_prompt_cache,
-    trim_prompt_cache,
-    can_trim_prompt_cache,
-)
-from mlx_lm.generate import generation_stream, maybe_quantize_kv_cache
+import sys
+from typing import Any, List, Optional
+
 import mlx.core as mx
 import mlx.nn as nn
-import sys
+from mlx_lm.generate import generation_stream, maybe_quantize_kv_cache
+from mlx_lm.models.cache import (
+    can_trim_prompt_cache,
+    make_prompt_cache,
+    trim_prompt_cache,
+)
+from mlx_lm.server import LRUPromptCache
+
 from mlx_engine.utils.prompt_progress_reporter import (
     PromptProgressReporter,
     StopPromptProcessing,
@@ -331,3 +335,145 @@ class CacheWrapper:
         Add the generated token to the token list, so that we can map the token to the KV cache.
         """
         self.tokens = mx.concat([self.tokens, mx.array([token])])
+
+
+class VisionCacheWrapper:
+    """
+    LRU-backed KV cache for VisionModelKit text-only requests.
+
+    Parallels CacheWrapper but uses a multi-slot LRU instead of a single-slot
+    cache.  VisionModelWrapper's KV cache is non-trimmable (ArraysCache), so
+    the trim-based prefix-reuse approach of CacheWrapper is unavailable.
+    Instead, a checkpoint is saved at the end of every prefill and fetched on
+    the next request, allowing arbitrarily long prefix matches across turns.
+
+    Lifecycle
+    ---------
+    - Instantiated once in VisionModelKit._full_model_init(), preserved across
+      subsequent _reset_for_prediction() calls so that LRU snapshots survive.
+    - clear() must be called before image requests: the vision branch creates
+      its own internal cache, so any stored text-only snapshot is stale and
+      would waste memory during the (already expensive) image forward pass.
+    """
+
+    def __init__(self, model, tokenizer) -> None:
+        """
+        Args:
+            model:     VisionModelWrapper — used for Phase 1 forward pass.
+            tokenizer: Model tokenizer — inspected for has_thinking /
+                       think_start_id to compute the checkpoint offset.
+        """
+        self._lru: LRUPromptCache = LRUPromptCache()
+        self._model = model
+        self._tokenizer = tokenizer
+
+    def clear(self) -> None:
+        """
+        Drop all cached KV snapshots and release the associated Metal buffers.
+
+        Call this before every image request.  The vision branch always builds
+        a fresh prompt cache internally, so any stored text-only snapshot
+        becomes stale after an image turn and would needlessly occupy memory
+        during the memory-intensive vision forward pass.
+        """
+        self._lru = LRUPromptCache()
+        mx.clear_cache()
+
+    def _checkpoint_offset(self, tokens: list) -> int:
+        """
+        Number of trailing tokens excluded from the checkpoint.
+
+        For thinking models the checkpoint is saved just *before* the
+        <think> token so that stream_generate always regenerates it —
+        required to keep the thinking-mode logit bias active.
+        For all other models the offset is 1 (standard last-token exclusion).
+        """
+        if getattr(self._tokenizer, "has_thinking", False):
+            think_id = self._tokenizer.think_start_id
+            for i in range(1, min(11, len(tokens))):
+                if tokens[-i] == think_id:
+                    return i + 1
+        return 1
+
+    def update_cache(
+        self,
+        prompt_tokens: list,
+        reporter: PromptProgressReporter,
+    ) -> tuple:
+        """
+        Set up the KV cache for the next text-only generation step.
+
+        The caller must pass *prompt_tokens* from LM Studio's stable
+        tokenisation (not the VLM processor's re-encoded ids, which vary
+        across turns and cause spurious cache misses).
+
+        Phase 1 — prefill all tokens except the last *checkpoint_offset*
+                   ones, in PROMPT_PROCESSING_CHUNK_SIZE-token blocks with
+                   eager eval + mx.clear_cache() between chunks.
+        Checkpoint — deep-copy the populated cache into the LRU so the next
+                     request can start from this prefix.
+        Phase 2 — the remaining *checkpoint_offset* tokens are returned to
+                   the caller for processing by stream_generate.
+
+        Args:
+            prompt_tokens: Stable list[int] token sequence from LM Studio.
+            reporter:      Progress reporter for prefill UI feedback.
+
+        Returns:
+            (cache, rest_tokens) — a pre-populated KV cache list and an
+            mx.array of the tokens still to be processed by stream_generate.
+
+        Raises:
+            StopPromptProcessing: if the user cancels during Phase 1.
+        """
+        offset = self._checkpoint_offset(prompt_tokens)
+
+        # --- LRU lookup ---
+        base_cache, rest = self._lru.fetch_nearest_cache("model", prompt_tokens)
+        if base_cache is None:
+            base_cache = make_prompt_cache(self._model.language_model)
+            rest = prompt_tokens
+        else:
+            cached = len(prompt_tokens) - len(rest)
+            logger.info(
+                f"[kv-seq] cache hit: {cached}/{len(prompt_tokens)} tokens cached"
+            )
+
+        # --- Phase 1: prefill rest[:-offset] in chunks ---
+        phase1_len = len(rest) - offset
+        cached_tokens = len(prompt_tokens) - len(rest)
+
+        reporter.begin(
+            is_draft=False,
+            cached_tokens=cached_tokens,
+            total_prompt_tokens=len(prompt_tokens),
+            prefill_tokens_processed=0,
+        )
+        processed = 0
+        if phase1_len > 0:
+            phase1_array = mx.array(rest[:phase1_len])
+            for i in range(0, phase1_len, PROMPT_PROCESSING_CHUNK_SIZE):
+                chunk = phase1_array[i : i + PROMPT_PROCESSING_CHUNK_SIZE][None]
+                self._model(chunk, cache=base_cache)
+                mx.eval([c.state for c in base_cache])
+                mx.clear_cache()
+                processed += chunk.shape[1]
+                if not reporter.update(
+                    is_draft=False,
+                    prefill_tokens_processed=cached_tokens + processed,
+                ):
+                    raise StopPromptProcessing
+        reporter.finish(
+            is_draft=False,
+            prefill_tokens_processed=cached_tokens + phase1_len,
+        )
+
+        # --- Checkpoint ---
+        checkpoint_key = prompt_tokens[:-offset]
+        self._lru.insert_cache(
+            "model", checkpoint_key, copy.deepcopy(base_cache), checkpoint=True
+        )
+        logger.info(f"[kv-seq] checkpoint saved at len={len(checkpoint_key)}")
+
+        # Phase 2 tokens: processed by stream_generate
+        return base_cache, mx.array(rest[-offset:])

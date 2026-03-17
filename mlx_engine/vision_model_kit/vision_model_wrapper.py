@@ -237,6 +237,26 @@ class VisionModelWrapper:
             self.mask = processed.attention_mask
             self.model_inputs = processed.other_inputs
 
+    def reset(self) -> None:
+        """
+        Reset per-request generation state without reloading model weights.
+
+        Zeroes all mutable state fields while preserving the vision_model
+        reference.  Use this instead of recreating the VisionModelWrapper to
+        avoid the 2-3 s overhead of mlx_vlm.utils.load() on every request.
+        """
+        self._model_attrs.update(
+            {
+                "input_ids": None,
+                "pixel_values": None,
+                "mask": None,
+                "first_call": False,
+                "decoder_input_ids": None,
+                "language_model_kwargs": {},
+                "model_inputs": {},
+            }
+        )
+
     @property
     def vision_model(self):
         return self._model_attrs["vision_model"]
