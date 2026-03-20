@@ -557,6 +557,46 @@ def _sequential_generation(
             model_kit.cache_wrapper.clear_text()
             _should_clear_text = False
 
+        # Validate image checkpoints against the current conversation prefix.
+        # The same image content can appear in different conversations (different
+        # system prompts, earlier messages, etc.).  When that happens the stored
+        # image_end_index and all KV positions are wrong for the current sequence.
+        # Compare a hash of the VLM token prefix up to the stored image_end_index
+        # against the current input_ids to detect and invalidate stale entries.
+        if (is_image_cache_hit or is_partial_cache_hit) and isinstance(
+            model_kit, VisionModelKit
+        ):
+            vlm_ids = model_kit.model.input_ids
+            if vlm_ids is not None:
+                check_key = (
+                    image_cache_key
+                    if is_image_cache_hit
+                    else hash_chain[:partial_depth]
+                )
+                entry = model_kit.cache_wrapper.get_image_checkpoint(check_key)
+                if entry is not None:
+                    _, stored_end_idx, stored_prefix_hash = entry
+                    if stored_end_idx > vlm_ids.shape[1]:
+                        is_stale = True
+                    else:
+                        is_stale = (
+                            hash(tuple(vlm_ids[0, :stored_end_idx].tolist()))
+                            != stored_prefix_hash
+                        )
+                    if is_stale:
+                        logger.warning(
+                            f"[kv-image] stale checkpoint (depth={len(check_key)}): "
+                            "prefix hash mismatch — saved from a different "
+                            "conversation; invalidating and falling back to full "
+                            "prefill."
+                        )
+                        model_kit.cache_wrapper.invalidate_image_checkpoint(check_key)
+                        is_image_cache_hit = False
+                        is_partial_cache_hit = False
+                        image_cache_key = None
+                        # The text LRU was not cleared on the (now-invalid) hit path.
+                        model_kit.cache_wrapper.clear_text()
+
         # Image cache hit: restore KV snapshot and prefill only the new text tokens.
         if is_image_cache_hit:
             # Check the text LRU first — a previous turn may have saved the full
@@ -584,7 +624,7 @@ def _sequential_generation(
             else:
                 # LRU miss (or stale exact match): fall back to image checkpoint
                 # + text re-prefill.
-                cache_snapshot, image_end_index = (
+                cache_snapshot, image_end_index, _ = (
                     model_kit.cache_wrapper.get_image_checkpoint(image_cache_key)
                 )
                 base_cache = copy.deepcopy(cache_snapshot)
@@ -646,10 +686,13 @@ def _sequential_generation(
                 yield construct_user_cancelled_result()
                 return
             # Save new per-block checkpoints so the next turn can be a full or deeper match.
-            for i, (end_idx, snap) in enumerate(new_block_checkpoints):
-                model_kit.cache_wrapper.save_image_checkpoint(
-                    hash_chain[: partial_depth + i + 1], snap, end_idx
-                )
+            vlm_ids = model_kit.model.input_ids
+            if vlm_ids is not None:
+                for i, (end_idx, snap) in enumerate(new_block_checkpoints):
+                    pfx_hash = hash(tuple(vlm_ids[0, :end_idx].tolist()))
+                    model_kit.cache_wrapper.save_image_checkpoint(
+                        hash_chain[: partial_depth + i + 1], snap, end_idx, pfx_hash
+                    )
             # Persist the full post-prefill state to the text LRU so subsequent
             # text turns can restore from here without re-prefilling from scratch.
             model_kit.cache_wrapper.save_post_prefill_snapshot(
@@ -777,21 +820,27 @@ def _sequential_generation(
             ):
                 _image_checkpoint_saved = True
                 block_checkpoints = model_kit.model.image_block_checkpoints
-                if block_checkpoints and len(block_checkpoints) == len(hash_chain):
-                    for i, (end_idx, snap) in enumerate(block_checkpoints):
+                vlm_ids = model_kit.model.input_ids
+                if vlm_ids is not None:
+                    if block_checkpoints and len(block_checkpoints) == len(hash_chain):
+                        for i, (end_idx, snap) in enumerate(block_checkpoints):
+                            pfx_hash = hash(tuple(vlm_ids[0, :end_idx].tolist()))
+                            model_kit.cache_wrapper.save_image_checkpoint(
+                                hash_chain[: i + 1], snap, end_idx, pfx_hash
+                            )
+                    elif (
+                        model_kit.model.image_kv_checkpoint is not None
+                        and model_kit.model.image_end_index is not None
+                    ):
+                        # Fallback: model did not expose per-block checkpoints.
+                        end_idx = model_kit.model.image_end_index
+                        pfx_hash = hash(tuple(vlm_ids[0, :end_idx].tolist()))
                         model_kit.cache_wrapper.save_image_checkpoint(
-                            hash_chain[: i + 1], snap, end_idx
+                            hash_chain,
+                            model_kit.model.image_kv_checkpoint,
+                            end_idx,
+                            pfx_hash,
                         )
-                elif (
-                    model_kit.model.image_kv_checkpoint is not None
-                    and model_kit.model.image_end_index is not None
-                ):
-                    # Fallback: model did not expose per-block checkpoints.
-                    model_kit.cache_wrapper.save_image_checkpoint(
-                        hash_chain,
-                        model_kit.model.image_kv_checkpoint,
-                        model_kit.model.image_end_index,
-                    )
 
             # record generated token to cache, if cache is active
             if model_kit.is_cross_prompt_cache_active():
