@@ -373,6 +373,88 @@ class TestVisionCacheWrapper(unittest.TestCase):
         current_hash = hash(tuple(ids[:stored_end]))
         self.assertEqual(current_hash, stored_hash, "Matching hash should pass")
 
+    # ------------------------------------------------------------------
+    # reorder_images_chronologically
+    # ------------------------------------------------------------------
+
+    def _make_hashes(self, *labels: str) -> list:
+        """Return stable fake hex digests for each label."""
+        return [f"{label:0>64}" for label in labels]
+
+    def test_reorder_no_checkpoints_keeps_bridge_order(self):
+        """With no checkpoints, bridge order is returned unchanged."""
+        wrapper = self._make_wrapper()
+        imgs = ["img_c", "img_b", "img_a"]
+        hashes = self._make_hashes("c", "b", "a")
+
+        out_imgs, out_hashes = wrapper.reorder_images_chronologically(imgs, hashes)
+
+        self.assertEqual(out_imgs, imgs)
+        self.assertEqual(out_hashes, hashes)
+
+    def test_reorder_two_images_no_checkpoint_unchanged(self):
+        """N=2 with no checkpoint: order preserved (mirrors bridge correct behaviour)."""
+        wrapper = self._make_wrapper()
+        imgs = ["img_a", "img_b"]
+        hashes = self._make_hashes("a", "b")
+
+        out_imgs, _ = wrapper.reorder_images_chronologically(imgs, hashes)
+
+        self.assertEqual(out_imgs, ["img_a", "img_b"])
+
+    def test_reorder_restores_chronological_order(self):
+        """Bridge sends [C, B, A]; checkpoint (a,)(a,b) exists → reordered to [A, B, C]."""
+        wrapper = self._make_wrapper()
+        ha, hb, hc = self._make_hashes("a", "b", "c")
+
+        wrapper.save_image_checkpoint((ha,), _make_cache(), 10, 0)
+        wrapper.save_image_checkpoint((ha, hb), _make_cache(), 20, 0)
+
+        imgs_bridge = ["img_c", "img_b", "img_a"]
+        hashes_bridge = [hc, hb, ha]
+
+        out_imgs, out_hashes = wrapper.reorder_images_chronologically(
+            imgs_bridge, hashes_bridge
+        )
+
+        self.assertEqual(out_imgs, ["img_a", "img_b", "img_c"])
+        self.assertEqual(out_hashes, [ha, hb, hc])
+
+    def test_reorder_new_image_appended_after_known(self):
+        """Bridge sends [B, C, D, A]; checkpoint (a,b,c) exists → [A, B, C, D]."""
+        wrapper = self._make_wrapper()
+        ha, hb, hc, hd = self._make_hashes("a", "b", "c", "d")
+
+        wrapper.save_image_checkpoint((ha,), _make_cache(), 10, 0)
+        wrapper.save_image_checkpoint((ha, hb), _make_cache(), 20, 0)
+        wrapper.save_image_checkpoint((ha, hb, hc), _make_cache(), 30, 0)
+
+        imgs_bridge = ["img_b", "img_c", "img_d", "img_a"]
+        hashes_bridge = [hb, hc, hd, ha]
+
+        out_imgs, out_hashes = wrapper.reorder_images_chronologically(
+            imgs_bridge, hashes_bridge
+        )
+
+        self.assertEqual(out_imgs, ["img_a", "img_b", "img_c", "img_d"])
+        self.assertEqual(out_hashes, [ha, hb, hc, hd])
+
+    def test_reorder_already_correct_order_unchanged(self):
+        """Bridge sends images in correct order: output equals input."""
+        wrapper = self._make_wrapper()
+        ha, hb, hc = self._make_hashes("a", "b", "c")
+
+        wrapper.save_image_checkpoint((ha,), _make_cache(), 10, 0)
+        wrapper.save_image_checkpoint((ha, hb), _make_cache(), 20, 0)
+
+        imgs = ["img_a", "img_b", "img_c"]
+        hashes = [ha, hb, hc]
+
+        out_imgs, out_hashes = wrapper.reorder_images_chronologically(imgs, hashes)
+
+        self.assertEqual(out_imgs, imgs)
+        self.assertEqual(out_hashes, hashes)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
