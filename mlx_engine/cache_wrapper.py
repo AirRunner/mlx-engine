@@ -411,9 +411,8 @@ class VisionCacheWrapper:
         """
         Drop text-only KV snapshots and release their Metal buffers.
 
-        Call this before an image request whose image is not in the checkpoint
-        store.  Image checkpoints are intentionally left intact so that a
-        cached image can still be reused on future turns.
+        Image checkpoints are intentionally left intact so that a cached image
+        can still be reused on future turns.
         """
         self._lru = LRUPromptCache()
         mx.clear_cache()
@@ -607,3 +606,86 @@ class VisionCacheWrapper:
 
         # Phase 2 tokens: processed by stream_generate
         return base_cache, mx.array(rest[-offset:])
+
+    def save_post_prefill_snapshot(self, prompt_tokens: list, cache) -> None:
+        """
+        Save a KV snapshot to the text LRU after an image-hit or partial-hit prefill.
+
+        Called by generate.py after prefill_text_after_image() or
+        prefill_with_partial_cache() so that subsequent text turns can
+        restore the full conversation state without re-prefilling from scratch.
+
+        Uses the same checkpoint offset as update_cache() to exclude trailing
+        think tokens from the key.
+
+        Args:
+            prompt_tokens: LM Studio stable token list for the current request.
+            cache:         KV cache after all text has been prefilled (will be
+                           deep-copied before insertion into the LRU).
+        """
+        offset = self._checkpoint_offset(prompt_tokens)
+        checkpoint_key = prompt_tokens[:-offset]
+        self._lru.insert_cache(
+            "model", checkpoint_key, copy.deepcopy(cache), checkpoint=True
+        )
+        logger.info(f"[kv-seq] post-image snapshot saved len={len(checkpoint_key)}")
+
+    def fetch_continuation_cache(self, prompt_tokens: list) -> tuple:
+        """
+        Look up the text LRU for a continuation snapshot saved by a previous
+        image-hit or partial-hit prefill (save_post_prefill_snapshot).
+
+        Returns:
+            (cache | None, remaining_tokens: list)
+            cache: deep-copied KV snapshot on hit, None on miss.
+            remaining_tokens: tokens not yet in the cache (empty on full hit).
+        """
+        return self._lru.fetch_nearest_cache("model", prompt_tokens)
+
+    def fetch_pre_image_cache(
+        self, vlm_input_ids_flat: list, img_tok: int, vid_tok: int
+    ) -> tuple:
+        """
+        Look up the text LRU using the VLM token prefix that precedes the
+        first image block.  On a hit the returned cache can be injected into
+        VisionModelWrapper as _pre_populated_cache so the vision tower runs on
+        top of already-prefilled text KV instead of a fresh cache.
+
+        Works for any model that exposes image_token_index on its config.
+        Falls back gracefully (returns None cache) when the LRU has no match.
+
+        Args:
+            vlm_input_ids_flat: flat list of VLM processor token ids for the
+                                 current request (input_ids[0].tolist()).
+            img_tok:             model config image_token_index.
+            vid_tok:             model config video_token_index (may equal img_tok).
+
+        Returns:
+            (cache | None, remaining_prefix: list, first_image_start: int)
+            cache:               deep-copied KV snapshot or None on miss.
+            remaining_prefix:    VLM token ids between the LRU boundary and
+                                 first_image_start; must be prefilled before use.
+            first_image_start:   index of the first image token in the flat id
+                                 list, or len(vlm_input_ids_flat) if none found.
+        """
+        # Locate the first image token
+        first_image_start = len(vlm_input_ids_flat)
+        for i, tok in enumerate(vlm_input_ids_flat):
+            if tok == img_tok or tok == vid_tok:
+                first_image_start = i
+                break
+
+        if first_image_start == 0:
+            # Image starts at position 0 — no pre-image text to cache
+            return None, [], 0
+
+        vlm_prefix = vlm_input_ids_flat[:first_image_start]
+        cache, rest = self._lru.fetch_nearest_cache("model", vlm_prefix)
+        if cache is None:
+            return None, vlm_prefix, first_image_start
+
+        cached_len = len(vlm_prefix) - len(rest)
+        logger.info(
+            f"[kv-seq] pre-image cache hit {cached_len}/{len(vlm_prefix)} tokens"
+        )
+        return cache, list(rest), first_image_start
