@@ -69,6 +69,8 @@ class VisionModelWrapper:
             "image_kv_checkpoint": None,
             # one (end_idx, cache_snapshot) entry per image block, in order
             "image_block_checkpoints": [],
+            # pre-populated KV cache injected by generate.py to reuse pre-image text KV
+            "_pre_populated_cache": None,
         }
 
     def __getattr__(self, name):
@@ -104,8 +106,15 @@ class VisionModelWrapper:
         if self.pixel_values is not None and not self.first_call:
             self.first_call = True
 
-            # Replace the mlx-lm specific prompt cache with the mlx-vlm prompt cache
-            cache = make_prompt_cache(self.language_model)
+            # Replace the mlx-lm specific prompt cache with the mlx-vlm prompt cache.
+            # If generate.py injected a pre-populated cache (see _pre_populated_cache),
+            # start from it instead of a fresh cache so the vision tower runs on top of
+            # already-prefilled text KV.
+            if self._pre_populated_cache is not None:
+                cache = self._pre_populated_cache
+                self._pre_populated_cache = None  # consume once
+            else:
+                cache = make_prompt_cache(self.language_model)
             kwargs["cache"] = cache
 
             embedding_output = self.vision_model.get_input_embeddings(
@@ -502,6 +511,7 @@ class VisionModelWrapper:
                 "image_end_index": None,
                 "image_kv_checkpoint": None,
                 "image_block_checkpoints": [],
+                "_pre_populated_cache": None,
             }
         )
 

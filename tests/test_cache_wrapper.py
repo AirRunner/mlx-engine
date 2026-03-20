@@ -1,8 +1,72 @@
+import types
 import unittest
 import mlx.core as mx
-from mlx_engine.cache_wrapper import CacheWrapper, StopPromptProcessing
+from mlx_engine.cache_wrapper import (
+    CacheWrapper,
+    VisionCacheWrapper,
+    StopPromptProcessing,
+)
 from tests.shared import model_getter, RecordingReporter, CancellingReporter
 from mlx_engine.generate import load_model, tokenize
+
+
+# ---------------------------------------------------------------------------
+# Shared mock infrastructure for TestVisionCacheWrapper
+# ---------------------------------------------------------------------------
+
+
+class _MockCacheEntry:
+    """Minimal KV cache entry compatible with LRUPromptCache (needs .nbytes)."""
+
+    def __init__(self):
+        self.nbytes = 256
+        self._state = mx.zeros((1,))
+
+    @property
+    def state(self):
+        return self._state
+
+    def is_trimmable(self):
+        return False
+
+
+def _make_cache(n: int = 2):
+    """Return a list of _MockCacheEntry objects that acts as a KV cache list."""
+    return [_MockCacheEntry() for _ in range(n)]
+
+
+class _MockLanguageModel:
+    def __call__(self, tokens, cache=None, **kwargs):
+        return types.SimpleNamespace(logits=mx.zeros((1, 1, 100)))
+
+
+class _MockVisionModel:
+    def __init__(self):
+        self.language_model = _MockLanguageModel()
+        self.config = types.SimpleNamespace(
+            image_token_index=9999,
+            video_token_index=9999,
+        )
+
+
+class _MockWrapper:
+    """Minimal VisionModelWrapper-like object for VisionCacheWrapper tests."""
+
+    def __init__(self):
+        self.vision_model = _MockVisionModel()
+        self.language_model = self.vision_model.language_model
+
+    def __call__(self, tokens, cache=None, **kwargs):
+        return self.language_model(tokens, cache=cache)
+
+
+class _MockTokenizer:
+    has_thinking = False
+
+
+class _MockThinkingTokenizer:
+    has_thinking = True
+    think_start_id = 8888
 
 
 class TestCacheWrapper(unittest.TestCase):
@@ -92,6 +156,160 @@ class TestCacheWrapper(unittest.TestCase):
 
         # Verify that the second attempt completed successfully
         self.assertIsNotNone(result_tokens)
+
+
+class TestVisionCacheWrapper(unittest.TestCase):
+    """Unit tests for VisionCacheWrapper's new unified cache methods."""
+
+    def _make_wrapper(self, tokenizer=None):
+        if tokenizer is None:
+            tokenizer = _MockTokenizer()
+        return VisionCacheWrapper(_MockWrapper(), tokenizer)
+
+    # ------------------------------------------------------------------
+    # save_post_prefill_snapshot / fetch_continuation_cache
+    # ------------------------------------------------------------------
+
+    def test_save_and_fetch_post_prefill_snapshot(self):
+        """Snapshot saved after image-hit prefill is retrieved on the next turn."""
+        wrapper = self._make_wrapper()
+        tokens = [1, 2, 3, 4, 5]
+        cache = _make_cache()
+        wrapper.save_post_prefill_snapshot(tokens, cache)
+
+        # Checkpoint key excludes the last token (offset=1 for non-thinking model)
+        result, rest = wrapper.fetch_continuation_cache(tokens)
+        self.assertIsNotNone(result)
+        # rest should be at most the last token
+        self.assertLessEqual(len(rest), 1)
+
+    def test_fetch_continuation_cache_miss(self):
+        """Empty LRU returns (None, full_tokens)."""
+        wrapper = self._make_wrapper()
+        tokens = [10, 20, 30]
+        result, rest = wrapper.fetch_continuation_cache(tokens)
+        self.assertIsNone(result)
+        self.assertEqual(rest, tokens)
+
+    def test_continuation_cache_hit_skips_reprefill(self):
+        """LRU hit condition used in generate.py: len(rest) <= 1 is satisfied."""
+        wrapper = self._make_wrapper()
+        tokens = list(range(50))
+        wrapper.save_post_prefill_snapshot(tokens, _make_cache())
+
+        result, rest = wrapper.fetch_continuation_cache(tokens)
+        self.assertIsNotNone(result)
+        self.assertLessEqual(
+            len(rest), 1, "Full hit should leave at most 1 token for stream_generate"
+        )
+
+    def test_save_post_prefill_snapshot_thinking_model(self):
+        """Thinking models: checkpoint key excludes <think> token and everything after."""
+        tokenizer = _MockThinkingTokenizer()
+        wrapper = self._make_wrapper(tokenizer)
+
+        # tokens[-2] is the think token → offset = 2 + 1 = 3 → key = tokens[:-3]
+        tokens = [1, 2, 3, 8888, 4]
+        wrapper.save_post_prefill_snapshot(tokens, _make_cache())
+
+        # Fetching with the full token list should hit (key covers tokens[:2])
+        result, rest = wrapper.fetch_continuation_cache(tokens)
+        self.assertIsNotNone(result)
+        # rest must contain the 3 tokens not in the key
+        self.assertEqual(len(rest), 3)
+
+    def test_clear_text_preserves_image_checkpoints(self):
+        """clear_text() drops LRU snapshots but keeps image checkpoints intact."""
+        wrapper = self._make_wrapper()
+        tokens = [1, 2, 3, 4]
+        wrapper.save_post_prefill_snapshot(tokens, _make_cache())
+        wrapper.save_image_checkpoint(("abc",), _make_cache(), 10)
+
+        wrapper.clear_text()
+
+        lru_result, _ = wrapper.fetch_continuation_cache(tokens)
+        self.assertIsNone(lru_result, "LRU should be empty after clear_text()")
+        self.assertIsNotNone(
+            wrapper.get_image_checkpoint(("abc",)),
+            "Image checkpoint should survive clear_text()",
+        )
+
+    # ------------------------------------------------------------------
+    # fetch_pre_image_cache
+    # ------------------------------------------------------------------
+
+    def test_fetch_pre_image_cache_exact_hit(self):
+        """LRU prefix exactly matches text before first image block."""
+        wrapper = self._make_wrapper()
+        # Manually insert a cache for the pre-image prefix [1, 2, 3]
+        wrapper._lru.insert_cache("model", [1, 2, 3], _make_cache(), checkpoint=True)
+
+        flat_ids = [1, 2, 3, 9999, 100, 101]  # image token at index 3
+        cache, rest, first_img = wrapper.fetch_pre_image_cache(flat_ids, 9999, 9999)
+
+        self.assertIsNotNone(cache)
+        self.assertEqual(rest, [], "Exact hit: no remaining tokens to top up")
+        self.assertEqual(first_img, 3)
+
+    def test_fetch_pre_image_cache_partial_hit(self):
+        """LRU covers a prefix shorter than the pre-image text → rest is non-empty."""
+        wrapper = self._make_wrapper()
+        wrapper._lru.insert_cache("model", [1, 2], _make_cache(), checkpoint=True)
+
+        flat_ids = [1, 2, 3, 9999, 100]
+        cache, rest, first_img = wrapper.fetch_pre_image_cache(flat_ids, 9999, 9999)
+
+        self.assertIsNotNone(cache)
+        self.assertEqual(rest, [3], "Should top up with the unmatched token")
+        self.assertEqual(first_img, 3)
+
+    def test_fetch_pre_image_cache_miss(self):
+        """Empty LRU returns (None, full_prefix, first_image_start)."""
+        wrapper = self._make_wrapper()
+        flat_ids = [50, 51, 9999, 100]
+        cache, rest, first_img = wrapper.fetch_pre_image_cache(flat_ids, 9999, 9999)
+
+        self.assertIsNone(cache)
+        self.assertEqual(rest, [50, 51])
+        self.assertEqual(first_img, 2)
+
+    def test_fetch_pre_image_cache_image_at_start(self):
+        """Image token at index 0: no pre-image text, no LRU lookup attempted."""
+        wrapper = self._make_wrapper()
+        # Insert something in LRU to verify it is NOT consulted
+        wrapper._lru.insert_cache("model", [9999], _make_cache(), checkpoint=True)
+
+        flat_ids = [9999, 1, 2, 3]
+        cache, rest, first_img = wrapper.fetch_pre_image_cache(flat_ids, 9999, 9999)
+
+        self.assertIsNone(cache)
+        self.assertEqual(rest, [])
+        self.assertEqual(first_img, 0)
+
+    def test_fetch_pre_image_cache_no_image_tokens(self):
+        """Sequence contains no image tokens: returns miss with full list."""
+        wrapper = self._make_wrapper()
+        flat_ids = [1, 2, 3, 4]
+        cache, rest, first_img = wrapper.fetch_pre_image_cache(flat_ids, 9999, 9999)
+
+        self.assertIsNone(cache)
+        self.assertEqual(rest, [1, 2, 3, 4])
+        self.assertEqual(first_img, 4)  # len(flat_ids), no image found
+
+    def test_fetch_pre_image_cache_video_token(self):
+        """Video tokens (vid_tok ≠ img_tok) are treated as image boundaries."""
+        wrapper = self._make_wrapper()
+        wrapper._lru.insert_cache("model", [1, 2], _make_cache(), checkpoint=True)
+
+        img_tok, vid_tok = 9999, 8888
+        flat_ids = [1, 2, 8888, 100]  # video token at index 2
+        cache, rest, first_img = wrapper.fetch_pre_image_cache(
+            flat_ids, img_tok, vid_tok
+        )
+
+        self.assertIsNotNone(cache)
+        self.assertEqual(rest, [])
+        self.assertEqual(first_img, 2)
 
 
 if __name__ == "__main__":
