@@ -477,7 +477,13 @@ def _sequential_generation(
             False  # deferred: cleared after process_prompt populates input_ids
         )
         if images_b64 and isinstance(model_kit, VisionModelKit):
-            hash_chain = tuple(_compute_image_hash(img) for img in images_b64)
+            img_hashes = [_compute_image_hash(img) for img in images_b64]
+            images_b64, img_hashes = (
+                model_kit.cache_wrapper.reorder_images_chronologically(
+                    images_b64, img_hashes
+                )
+            )
+            hash_chain = tuple(img_hashes)
             result = model_kit.cache_wrapper.find_deepest_image_checkpoint(hash_chain)
             if result is not None and result[0] == hash_chain:
                 # All images in the current turn are cached.
@@ -485,7 +491,7 @@ def _sequential_generation(
                 image_cache_key = hash_chain
                 logger.info(f"[kv-image] cache hit depth={len(hash_chain)}")
             elif result is not None:
-                # Some leading images are cached — only run vision tower for new ones.
+                # Some leading images are cached; only run vision tower for new ones.
                 is_partial_cache_hit = True
                 partial_depth = len(result[0])
                 partial_snapshot = result[1]
@@ -586,9 +592,8 @@ def _sequential_generation(
                     if is_stale:
                         logger.warning(
                             f"[kv-image] stale checkpoint (depth={len(check_key)}): "
-                            "prefix hash mismatch — saved from a different "
-                            "conversation; invalidating and falling back to full "
-                            "prefill."
+                            "prefix hash mismatch, saved from a different conversation; "
+                            "invalidating and falling back to full prefill."
                         )
                         model_kit.cache_wrapper.invalidate_image_checkpoint(check_key)
                         is_image_cache_hit = False
@@ -599,7 +604,7 @@ def _sequential_generation(
 
         # Image cache hit: restore KV snapshot and prefill only the new text tokens.
         if is_image_cache_hit:
-            # Check the text LRU first — a previous turn may have saved the full
+            # Check the text LRU first: a previous turn may have saved the full
             # post-prefill state (system prompt + images + conversation so far),
             # allowing us to skip the text re-prefill entirely.
             lru_cache, lru_rest = model_kit.cache_wrapper.fetch_continuation_cache(
@@ -705,7 +710,7 @@ def _sequential_generation(
             generate_args.pop("input_embeddings", None)
 
         # VisionCacheWrapper: LRU prefix caching for text-only VisionModelKit requests.
-        # Uses prompt_tokens (LM Studio's stable tokenisation) as the LRU key — not
+        # Uses prompt_tokens (LM Studio's stable tokenisation) as the LRU key, not
         # input_tokens (VLM processor re-encodes inconsistently across turns).
         is_text_only_vlm = (
             isinstance(model_kit, VisionModelKit)

@@ -475,6 +475,57 @@ class VisionCacheWrapper:
                 return key, entry[0], entry[1]
         return None
 
+    # TODO: remove once lmstudio-ai/lmstudio-bug-tracker#1663 is fixed upstream.
+    def reorder_images_chronologically(
+        self,
+        images_b64: list,
+        image_hashes: list,
+    ) -> tuple:
+        """Reorder images into chronological conversation order using stored checkpoints.
+
+        Uses the checkpoint history, built turn-by-turn in the correct order,
+        to reconstruct the canonical image sequence. Any images not yet seen
+        in a checkpoint are appended in the order received.
+
+        Args:
+            images_b64:   Images as received, possibly out of order.
+            image_hashes: SHA-256 hex digests corresponding to images_b64.
+
+        Returns:
+            (reordered_images_b64, reordered_hashes) in chronological order.
+            Returns the inputs unchanged when no checkpoint overlap is found
+            (e.g. the very first turn).
+        """
+        hash_set = set(image_hashes)
+
+        # Find the deepest checkpoint whose entire key is a subset of received hashes.
+        best_key: tuple = ()
+        for key in self._image_checkpoints:
+            if len(key) > len(best_key) and all(h in hash_set for h in key):
+                best_key = key
+
+        if not best_key:
+            return images_b64, image_hashes
+
+        hash_to_img = dict(zip(image_hashes, images_b64))
+        known = set(best_key)
+        ordered_imgs = [hash_to_img[h] for h in best_key]
+        ordered_hashes = list(best_key)
+
+        # New images: in the received set but absent from the checkpoint, bridge order.
+        new_imgs = [img for img, h in zip(images_b64, image_hashes) if h not in known]
+        new_hashes = [h for h in image_hashes if h not in known]
+
+        reordered_imgs = ordered_imgs + new_imgs
+        reordered_hashes = ordered_hashes + new_hashes
+
+        if reordered_hashes != image_hashes:
+            logger.info(
+                f"[kv-image] reordered {len(images_b64)} images to chronological order"
+            )
+
+        return reordered_imgs, reordered_hashes
+
     def prefill_text_after_image(
         self,
         base_cache,
@@ -554,20 +605,20 @@ class VisionCacheWrapper:
         tokenisation (not the VLM processor's re-encoded ids, which vary
         across turns and cause spurious cache misses).
 
-        Phase 1 — prefill all tokens except the last *checkpoint_offset*
-                   ones, in PROMPT_PROCESSING_CHUNK_SIZE-token blocks with
-                   eager eval + mx.clear_cache() between chunks.
-        Checkpoint — deep-copy the populated cache into the LRU so the next
-                     request can start from this prefix.
-        Phase 2 — the remaining *checkpoint_offset* tokens are returned to
-                   the caller for processing by stream_generate.
+        Phase 1: prefill all tokens except the last *checkpoint_offset*
+                 ones, in PROMPT_PROCESSING_CHUNK_SIZE-token blocks with
+                 eager eval + mx.clear_cache() between chunks.
+        Checkpoint: deep-copy the populated cache into the LRU so the next
+                    request can start from this prefix.
+        Phase 2: the remaining *checkpoint_offset* tokens are returned to
+                 the caller for processing by stream_generate.
 
         Args:
             prompt_tokens: Stable list[int] token sequence from LM Studio.
             reporter:      Progress reporter for prefill UI feedback.
 
         Returns:
-            (cache, rest_tokens) — a pre-populated KV cache list and an
+            (cache, rest_tokens): a pre-populated KV cache list and an
             mx.array of the tokens still to be processed by stream_generate.
 
         Raises:
@@ -692,7 +743,7 @@ class VisionCacheWrapper:
                 break
 
         if first_image_start == 0:
-            # Image starts at position 0 — no pre-image text to cache
+            # Image starts at position 0: no pre-image text to cache.
             return None, [], 0
 
         vlm_prefix = vlm_input_ids_flat[:first_image_start]
