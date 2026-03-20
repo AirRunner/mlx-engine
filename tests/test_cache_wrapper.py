@@ -223,7 +223,7 @@ class TestVisionCacheWrapper(unittest.TestCase):
         wrapper = self._make_wrapper()
         tokens = [1, 2, 3, 4]
         wrapper.save_post_prefill_snapshot(tokens, _make_cache())
-        wrapper.save_image_checkpoint(("abc",), _make_cache(), 10)
+        wrapper.save_image_checkpoint(("abc",), _make_cache(), 10, 0xABC)
 
         wrapper.clear_text()
 
@@ -310,6 +310,68 @@ class TestVisionCacheWrapper(unittest.TestCase):
         self.assertIsNotNone(cache)
         self.assertEqual(rest, [])
         self.assertEqual(first_img, 2)
+
+    # ------------------------------------------------------------------
+    # prefix hash validation (save / invalidate / get_image_checkpoint)
+    # ------------------------------------------------------------------
+
+    def test_save_image_checkpoint_stores_prefix_hash(self):
+        """Saved checkpoint exposes (snapshot, end_idx, prefix_hash) as a 3-tuple."""
+        wrapper = self._make_wrapper()
+        cache = _make_cache()
+        wrapper.save_image_checkpoint(("h1",), cache, 42, 0xDEAD)
+
+        entry = wrapper.get_image_checkpoint(("h1",))
+        self.assertIsNotNone(entry)
+        self.assertEqual(len(entry), 3)
+        snapshot, end_idx, pfx_hash = entry
+        self.assertIs(snapshot, cache)
+        self.assertEqual(end_idx, 42)
+        self.assertEqual(pfx_hash, 0xDEAD)
+
+    def test_invalidate_image_checkpoint_removes_entry(self):
+        """invalidate_image_checkpoint() removes the entry; subsequent lookup returns None."""
+        wrapper = self._make_wrapper()
+        wrapper.save_image_checkpoint(("h1",), _make_cache(), 10, 0xABC)
+        self.assertIsNotNone(wrapper.get_image_checkpoint(("h1",)))
+
+        wrapper.invalidate_image_checkpoint(("h1",))
+        self.assertIsNone(wrapper.get_image_checkpoint(("h1",)))
+
+    def test_invalidate_image_checkpoint_missing_key_is_noop(self):
+        """invalidate_image_checkpoint() on a non-existent key does not raise."""
+        wrapper = self._make_wrapper()
+        wrapper.invalidate_image_checkpoint(("nonexistent",))  # must not raise
+
+    def test_prefix_hash_mismatch_detected(self):
+        """Storing a checkpoint with one hash and querying with another is detectable."""
+        wrapper = self._make_wrapper()
+        ids = [1, 2, 3, 4, 5]
+        end_idx = 3
+        correct_hash = hash(tuple(ids[:end_idx]))  # hash of [1, 2, 3]
+        wrong_hash = correct_hash ^ 0xFFFFFFFF  # guaranteed to differ
+
+        wrapper.save_image_checkpoint(("img",), _make_cache(), end_idx, wrong_hash)
+        entry = wrapper.get_image_checkpoint(("img",))
+        self.assertIsNotNone(entry)
+        # Simulate the validation logic in generate.py
+        _, stored_end, stored_hash = entry
+        current_hash = hash(tuple(ids[:stored_end]))
+        self.assertNotEqual(current_hash, stored_hash, "Mismatch should be detected")
+
+    def test_prefix_hash_match_accepted(self):
+        """Checkpoint saved with the correct prefix hash passes validation."""
+        wrapper = self._make_wrapper()
+        ids = [10, 20, 30, 40]
+        end_idx = 3
+        pfx_hash = hash(tuple(ids[:end_idx]))
+
+        wrapper.save_image_checkpoint(("img",), _make_cache(), end_idx, pfx_hash)
+        entry = wrapper.get_image_checkpoint(("img",))
+        self.assertIsNotNone(entry)
+        _, stored_end, stored_hash = entry
+        current_hash = hash(tuple(ids[:stored_end]))
+        self.assertEqual(current_hash, stored_hash, "Matching hash should pass")
 
 
 if __name__ == "__main__":

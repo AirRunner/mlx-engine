@@ -337,6 +337,7 @@ class CacheWrapper:
         self.tokens = mx.concat([self.tokens, mx.array([token])])
 
 
+# TODO: extract a shared ABC for CacheWrapper and VisionCacheWrapper.
 class VisionCacheWrapper:
     """
     LRU-backed KV cache for VisionModelKit requests.
@@ -399,7 +400,7 @@ class VisionCacheWrapper:
         mx.clear_cache()
 
     def save_image_checkpoint(
-        self, key: tuple, cache_snapshot, image_end_index: int
+        self, key: tuple, cache_snapshot, image_end_index: int, prefix_hash: int
     ) -> None:
         """
         Persist a KV snapshot taken right after an image block.
@@ -409,17 +410,32 @@ class VisionCacheWrapper:
                              including this block, e.g. (hash1,) or (hash1, hash2).
             cache_snapshot:  Deep-copied KV cache list from VisionModelWrapper.
             image_end_index: First text-token index after this image block.
+            prefix_hash:     Python hash of the VLM token ids
+                             ``input_ids[0, :image_end_index]`` at save time.
+                             Used to detect stale checkpoints from a different
+                             conversation that happens to share the same images.
         """
-        self._image_checkpoints[key] = (cache_snapshot, image_end_index)
+        self._image_checkpoints[key] = (cache_snapshot, image_end_index, prefix_hash)
         logger.info(
             f"[kv-image] checkpoint saved depth={len(key)} index={image_end_index}"
         )
 
     def get_image_checkpoint(self, key: tuple):
         """
-        Return (cache_snapshot, image_end_index) for *key*, or None.
+        Return ``(cache_snapshot, image_end_index, prefix_hash)`` for *key*, or None.
         """
         return self._image_checkpoints.get(key)
+
+    def invalidate_image_checkpoint(self, key: tuple) -> None:
+        """
+        Remove a stale image checkpoint.
+
+        Called when the prefix hash of an existing checkpoint no longer matches
+        the current conversation, indicating that the KV positions stored in the
+        snapshot correspond to a different conversation and must not be reused.
+        """
+        self._image_checkpoints.pop(key, None)
+        logger.info(f"[kv-image] stale checkpoint invalidated depth={len(key)}")
 
     def find_deepest_image_checkpoint(self, hash_chain: tuple):
         """
