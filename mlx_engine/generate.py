@@ -42,7 +42,7 @@ from mlx_engine.utils.speculative_decoding import (
 )
 from outlines.processors.structured import JSONLogitsProcessor
 from mlx_engine.utils.outlines_transformer_tokenizer import OutlinesTransformerTokenizer
-from mlx_engine.cache_wrapper import PROMPT_PROCESSING_CHUNK_SIZE
+from mlx_engine.cache_wrapper import PROMPT_PROCESSING_CHUNK_SIZE, _image_block_lengths
 from mlx_engine.utils.prompt_progress_reporter import (
     BatchedMlxLmReporterAdapter,
     LoggerReporter,
@@ -65,6 +65,52 @@ MAX_TOP_LOGPROBS = 10
 
 
 logger = logging.getLogger(__name__)
+
+
+def _inject_pre_image_cache(model_kit: "VisionModelKit", vlm_ids) -> None:
+    """Inject a pre-image KV cache snapshot into VisionModelWrapper, if available.
+
+    Looks up the text LRU for a snapshot covering all tokens before the first
+    image block.  If found, tops up any remaining tokens not yet in the cache,
+    then injects the snapshot so the vision tower forward pass starts from there
+    instead of from a fresh cache, avoiding re-prefill of the entire text prefix.
+
+    Also sets ``_pre_image_start`` so Phase 1 in VisionModelWrapper begins at
+    the first image token position rather than 0, preventing a redundant pass
+    over already-cached text tokens.
+
+    No-op when the model config does not expose ``image_token_index``, or when
+    the text LRU does not contain a usable snapshot.
+    """
+    try:
+        img_tok = model_kit.model.vision_model.config.image_token_index
+        vid_tok = getattr(
+            model_kit.model.vision_model.config, "video_token_index", img_tok
+        )
+        pre_cache, pre_rest, first_image_start = (
+            model_kit.cache_wrapper.fetch_pre_image_cache(
+                vlm_ids[0].tolist(), img_tok, vid_tok
+            )
+        )
+    except AttributeError:
+        return
+
+    if pre_cache is None:
+        return
+
+    if pre_rest:
+        rest_arr = mx.array(pre_rest)
+        for i in range(0, len(pre_rest), PROMPT_PROCESSING_CHUNK_SIZE):
+            chunk = rest_arr[i : i + PROMPT_PROCESSING_CHUNK_SIZE][None]
+            model_kit.model.language_model(chunk, cache=pre_cache)
+            mx.eval([c.state for c in pre_cache])
+            mx.clear_cache()
+
+    model_kit.model._pre_populated_cache = pre_cache
+    model_kit.model._pre_image_start = first_image_start
+    logger.info(
+        f"[kv-seq] pre-image text KV injected (first_image_start={first_image_start})"
+    )
 
 
 def _compute_image_hash(image_b64: str) -> str:
@@ -488,6 +534,10 @@ def _sequential_generation(
                 # Defer clearing the text LRU until after process_prompt() has run
                 # so we can attempt to reuse the pre-image text KV cache first.
                 _should_clear_text = True
+        elif isinstance(model_kit, VisionModelKit):
+            # No images in this request — free any image checkpoints left over from
+            # a previous conversation so their Metal buffers are returned to the pool.
+            model_kit.cache_wrapper.clear_image_checkpoints()
 
         # Process prompt
         try:
@@ -513,48 +563,37 @@ def _sequential_generation(
         if _should_clear_text and isinstance(model_kit, VisionModelKit):
             vlm_ids = model_kit.model.input_ids
             if vlm_ids is not None:
-                try:
-                    img_tok = model_kit.model.vision_model.config.image_token_index
-                    vid_tok = getattr(
-                        model_kit.model.vision_model.config,
-                        "video_token_index",
-                        img_tok,
-                    )
-                    pre_cache, pre_rest, _ = (
-                        model_kit.cache_wrapper.fetch_pre_image_cache(
-                            vlm_ids[0].tolist(), img_tok, vid_tok
-                        )
-                    )
-                except AttributeError:
-                    pre_cache, pre_rest = None, []
-
-                if pre_cache is not None:
-                    # Top up the cache with any tokens between the LRU boundary and
-                    # the first image block (typically zero tokens on exact match).
-                    if pre_rest:
-                        rest_arr = mx.array(pre_rest)
-                        for i in range(0, len(pre_rest), PROMPT_PROCESSING_CHUNK_SIZE):
-                            chunk = rest_arr[i : i + PROMPT_PROCESSING_CHUNK_SIZE][None]
-                            model_kit.model.language_model(chunk, cache=pre_cache)
-                            mx.eval([c.state for c in pre_cache])
-                            mx.clear_cache()
-                    # Inject into VisionModelWrapper; __call__ will use it instead of
-                    # creating a fresh cache, so the vision tower runs on top of the
-                    # already-prefilled text KV.
-                    model_kit.model._pre_populated_cache = pre_cache
-                    logger.info("[kv-seq] pre-image text KV cache injected")
-
-            # Always clear the text LRU now.  The pre_cache came from a deepcopy
+                _inject_pre_image_cache(model_kit, vlm_ids)
+            # Always clear the text LRU now.  The injected cache came from a deepcopy
             # inside fetch_nearest_cache so it is independent of the LRU entries.
             model_kit.cache_wrapper.clear_text()
             _should_clear_text = False
 
-        # Validate image checkpoints against the current conversation prefix.
-        # The same image content can appear in different conversations (different
-        # system prompts, earlier messages, etc.).  When that happens the stored
-        # image_end_index and all KV positions are wrong for the current sequence.
-        # Compare a hash of the VLM token prefix up to the stored image_end_index
-        # against the current input_ids to detect and invalidate stale entries.
+        # Pre-compute image block lengths from the VLM token sequence for use in
+        # the staleness check and checkpoint save calls below.
+        current_block_lengths: tuple = ()
+        _img_tok: Optional[int] = None
+        _vid_tok: Optional[int] = None
+        if images_b64 and isinstance(model_kit, VisionModelKit):
+            vlm_ids_bl = model_kit.model.input_ids
+            if vlm_ids_bl is not None:
+                try:
+                    _img_tok = model_kit.model.vision_model.config.image_token_index
+                    _vid_tok = getattr(
+                        model_kit.model.vision_model.config,
+                        "video_token_index",
+                        _img_tok,
+                    )
+                    current_block_lengths = _image_block_lengths(
+                        vlm_ids_bl[0].tolist(), _img_tok, _vid_tok
+                    )
+                except AttributeError:
+                    pass
+
+        # Validate the deepest matching image checkpoint against the current
+        # conversation prefix.  The same image may appear in different conversations
+        # (different system prompts, earlier messages), in which case stored KV
+        # positions are wrong for the current sequence and must be invalidated.
         if (is_image_cache_hit or is_partial_cache_hit) and isinstance(
             model_kit, VisionModelKit
         ):
@@ -565,100 +604,53 @@ def _sequential_generation(
                     if is_image_cache_hit
                     else hash_chain[:partial_depth]
                 )
-                entry = model_kit.cache_wrapper.get_image_checkpoint(check_key)
-                if entry is not None:
-                    _, stored_end_idx, stored_prefix_hash = entry
-                    if stored_end_idx > vlm_ids.shape[1]:
-                        is_stale = True
-                    else:
-                        is_stale = (
-                            hash(tuple(vlm_ids[0, :stored_end_idx].tolist()))
-                            != stored_prefix_hash
-                        )
-                    if is_stale:
-                        logger.warning(
-                            f"[kv-image] stale checkpoint (depth={len(check_key)}): "
-                            "prefix hash mismatch, saved from a different conversation; "
-                            "invalidating and falling back to full prefill."
-                        )
-                        model_kit.cache_wrapper.invalidate_image_checkpoint(check_key)
-                        is_image_cache_hit = False
-                        is_partial_cache_hit = False
-                        image_cache_key = None
-                        # The text LRU was not cleared on the (now-invalid) hit path.
-                        model_kit.cache_wrapper.clear_text()
+                if model_kit.cache_wrapper.validate_image_checkpoint(
+                    check_key, vlm_ids, _img_tok, _vid_tok, current_block_lengths
+                ):
+                    logger.warning(
+                        f"[kv-image] invalidating all image checkpoints "
+                        f"(depth={len(check_key)}): stale KV state detected; "
+                        "falling back to full prefill."
+                    )
+                    is_image_cache_hit = False
+                    is_partial_cache_hit = False
+                    image_cache_key = None
+                    # Clear only image checkpoints (all stale).  Preserve the text
+                    # LRU: the system prompt KV is still valid even when image
+                    # tokenisation changes.  Inject a pre-image snapshot so the
+                    # re-prefill starts from the first image token rather than 0.
+                    model_kit.cache_wrapper.clear_image_checkpoints()
+                    _inject_pre_image_cache(model_kit, vlm_ids)
 
         # Image cache hit: restore KV snapshot and prefill only the new text tokens.
         if is_image_cache_hit:
-            # Check the text LRU first: a previous turn may have saved the full
-            # post-prefill state (system prompt + images + conversation so far),
-            # allowing us to skip the text re-prefill entirely.
-            lru_cache, lru_rest = model_kit.cache_wrapper.fetch_continuation_cache(
-                list(prompt_tokens)
-            )
-            # Only use the LRU when exactly one token remains to be fed to the
-            # model (the standard checkpoint-offset case).  An exact match
-            # (lru_rest == []) means the stored key came from a *longer*
-            # previous conversation and is semantically stale; fall through to
-            # the re-prefill path instead of risking a misaligned KV cache.
-            if lru_cache is not None and len(lru_rest) == 1:
-                logger.info(
-                    f"[kv-seq] continuation cache hit "
-                    f"({len(prompt_tokens) - 1}/{len(prompt_tokens)} tokens)"
-                )
-                base_cache = lru_cache  # already deep-copied by fetch_nearest_cache
-                input_tokens = mx.array(lru_rest)
-                model_kit.model.language_model_kwargs = {"cache": base_cache}
-                model_kit.model.first_call = True
-                model_kit.model.pixel_values = None
-                generate_args.pop("input_embeddings", None)
-            else:
-                # LRU miss (or stale exact match): fall back to image checkpoint
-                # + text re-prefill.
-                cache_snapshot, image_end_index, _ = (
-                    model_kit.cache_wrapper.get_image_checkpoint(image_cache_key)
-                )
-                base_cache = copy.deepcopy(cache_snapshot)
-
-                # Text tokens after the image block in VLM input_ids space
-                vlm_text_tokens = model_kit.model.input_ids[:, image_end_index:]
-
-                try:
-                    base_cache, last_token = (
-                        model_kit.cache_wrapper.prefill_text_after_image(
-                            base_cache, vlm_text_tokens, prompt_progress_reporter
-                        )
+            try:
+                base_cache, last_token = (
+                    model_kit.cache_wrapper.restore_post_image_cache(
+                        list(prompt_tokens),
+                        image_cache_key,
+                        model_kit.model.input_ids,
+                        prompt_progress_reporter,
                     )
-                except StopPromptProcessing:
-                    yield construct_user_cancelled_result()
-                    return
-
-                # Guard: if the stored image_end_index is at or past the end of
-                # the current input_ids (e.g. the checkpoint was saved from a
-                # different conversation), last_token is empty.  Fall back to
-                # the last VLM token so generation can still start correctly.
-                if last_token.shape[0] == 0:
-                    logger.warning(
-                        f"[kv-image] prefill_text_after_image: image_end_index "
-                        f"({image_end_index}) >= input_ids length "
-                        f"({model_kit.model.input_ids.shape[1]}); "
-                        "using last VLM token as decode start."
-                    )
-                    last_token = model_kit.model.input_ids[0, -1:]
-
-                # Persist the post-prefill state so the next turn can restore it
-                # from the LRU and skip this text re-prefill.
-                model_kit.cache_wrapper.save_post_prefill_snapshot(
-                    list(prompt_tokens), base_cache
                 )
+            except StopPromptProcessing:
+                yield construct_user_cancelled_result()
+                return
 
-                # Inject the pre-filled cache into VisionModelWrapper and mark the
-                # image prefill as already done so that __call__ goes to the decode path.
-                model_kit.model.language_model_kwargs = {"cache": base_cache}
-                model_kit.model.first_call = True
-                model_kit.model.pixel_values = None
-                input_tokens = last_token
-                generate_args.pop("input_embeddings", None)
+            # Guard: image_end_index past end of sequence (stale checkpoint edge
+            # case); fall back to the last VLM token so generation can start.
+            if last_token.shape[0] == 0:
+                logger.warning(
+                    "[kv-image] restore_post_image_cache returned empty last_token; "
+                    "using last VLM token as decode start."
+                )
+                last_token = model_kit.model.input_ids[0, -1:]
+
+            model_kit.model.language_model_kwargs = {"cache": base_cache}
+            model_kit.model.first_call = True
+            model_kit.model.pixel_values = None
+            input_tokens = last_token
+            generate_args.pop("input_embeddings", None)
 
         # Partial image cache hit: restore KV at partial_depth, run vision tower only
         # for new images, prefill the suffix, save new per-block checkpoints.
@@ -679,11 +671,13 @@ def _sequential_generation(
             # Save new per-block checkpoints so the next turn can be a full or deeper match.
             vlm_ids = model_kit.model.input_ids
             if vlm_ids is not None:
-                for i, (end_idx, snap) in enumerate(new_block_checkpoints):
-                    pfx_hash = hash(tuple(vlm_ids[0, :end_idx].tolist()))
-                    model_kit.cache_wrapper.save_image_checkpoint(
-                        hash_chain[: partial_depth + i + 1], snap, end_idx, pfx_hash
-                    )
+                model_kit.cache_wrapper.save_block_checkpoints(
+                    hash_chain,
+                    partial_depth,
+                    new_block_checkpoints,
+                    vlm_ids,
+                    current_block_lengths,
+                )
             # Persist the full post-prefill state to the text LRU so subsequent
             # text turns can restore from here without re-prefilling from scratch.
             model_kit.cache_wrapper.save_post_prefill_snapshot(
@@ -814,11 +808,13 @@ def _sequential_generation(
                 vlm_ids = model_kit.model.input_ids
                 if vlm_ids is not None:
                     if block_checkpoints and len(block_checkpoints) == len(hash_chain):
-                        for i, (end_idx, snap) in enumerate(block_checkpoints):
-                            pfx_hash = hash(tuple(vlm_ids[0, :end_idx].tolist()))
-                            model_kit.cache_wrapper.save_image_checkpoint(
-                                hash_chain[: i + 1], snap, end_idx, pfx_hash
-                            )
+                        model_kit.cache_wrapper.save_block_checkpoints(
+                            hash_chain,
+                            0,
+                            block_checkpoints,
+                            vlm_ids,
+                            current_block_lengths,
+                        )
                     elif (
                         model_kit.model.image_kv_checkpoint is not None
                         and model_kit.model.image_end_index is not None
@@ -831,6 +827,7 @@ def _sequential_generation(
                             model_kit.model.image_kv_checkpoint,
                             end_idx,
                             pfx_hash,
+                            current_block_lengths,
                         )
 
             # record generated token to cache, if cache is active

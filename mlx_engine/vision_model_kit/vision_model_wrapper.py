@@ -71,6 +71,9 @@ class VisionModelWrapper:
             "image_block_checkpoints": [],
             # pre-populated KV cache injected by generate.py to reuse pre-image text KV
             "_pre_populated_cache": None,
+            # first image token position in VLM input_ids, set alongside _pre_populated_cache
+            # so Phase 1 starts there instead of 0, avoiding re-prefilling cached text tokens
+            "_pre_image_start": None,
         }
 
     def __getattr__(self, name):
@@ -113,8 +116,13 @@ class VisionModelWrapper:
             if self._pre_populated_cache is not None:
                 cache = self._pre_populated_cache
                 self._pre_populated_cache = None  # consume once
+                # Start Phase 1 at the first image token so we don't re-prefill
+                # the text tokens already covered by the injected pre-image cache.
+                pre_image_start = self._pre_image_start or 0
+                self._pre_image_start = None
             else:
                 cache = make_prompt_cache(self.language_model)
+                pre_image_start = 0
             kwargs["cache"] = cache
 
             embedding_output = self.vision_model.get_input_embeddings(
@@ -177,8 +185,11 @@ class VisionModelWrapper:
                 # Phase 1: process each image block and checkpoint after each one.
                 # This enables VisionCacheWrapper to restore KV state at any image
                 # boundary, so only new images need re-processing on the next turn.
+                # Start from pre_image_start (the first image token position) when
+                # a pre-populated cache was injected, so we don't re-prefill the
+                # text tokens that are already in the cache.
                 block_checkpoints = []
-                prev = 0
+                prev = pre_image_start
                 for block_end in block_ends:
                     for start in range(prev, block_end, PROMPT_PROCESSING_CHUNK_SIZE):
                         end = min(start + PROMPT_PROCESSING_CHUNK_SIZE, block_end)
@@ -512,6 +523,7 @@ class VisionModelWrapper:
                 "image_kv_checkpoint": None,
                 "image_block_checkpoints": [],
                 "_pre_populated_cache": None,
+                "_pre_image_start": None,
             }
         )
 
