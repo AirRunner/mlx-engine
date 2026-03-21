@@ -841,7 +841,7 @@ class VisionCacheWrapper:
                     raise StopPromptProcessing
         reporter.finish(
             is_draft=False,
-            prefill_tokens_processed=phase1_len,
+            prefill_tokens_processed=len(rest),
         )
 
         checkpoint_key = prompt_tokens[:-offset]
