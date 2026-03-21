@@ -101,9 +101,12 @@ class VisionModelKit(ModelKit):
         if prior is not None:
             prior._model = self.model
             prior._tokenizer = self.tokenizer
+            prior._model_path = str(self.model_path)
             self.cache_wrapper = prior
         else:
-            self.cache_wrapper = VisionCacheWrapper(self.model, self.tokenizer)
+            self.cache_wrapper = VisionCacheWrapper(
+                self.model, self.tokenizer, model_path=self.model_path
+            )
         mx.clear_cache()
 
     def _initializer(self):

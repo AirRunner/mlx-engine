@@ -13,6 +13,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.server import LRUPromptCache
 
+from mlx_engine.disk_kv_cache import DiskKVCacheStore
 from mlx_engine.utils.prompt_progress_reporter import (
     PromptProgressReporter,
     StopPromptProcessing,
@@ -362,6 +363,29 @@ class CacheWrapper:
         self.tokens = mx.concat([self.tokens, mx.array([token])])
 
 
+def _find_system_prompt_boundary(prompt_tokens: list, tokenizer) -> Optional[int]:
+    """Return the index of the second <|im_start|> token in *prompt_tokens*.
+
+    For ChatML-format models this marks the boundary between the system prompt
+    and the first user turn, allowing the disk KV cache to be keyed on the
+    system prompt alone so it matches any future conversation.
+
+    Returns None when the model does not use ChatML or when the sequence does
+    not contain at least two <|im_start|> tokens (e.g. no system prompt).
+    """
+    try:
+        vocab = tokenizer.get_vocab()
+    except Exception:
+        return None
+    im_start_id = vocab.get("<|im_start|>")
+    if im_start_id is None:
+        return None
+    positions = [i for i, t in enumerate(prompt_tokens) if t == im_start_id]
+    if len(positions) < 2:
+        return None
+    return positions[1]
+
+
 # TODO: extract a shared ABC for CacheWrapper and VisionCacheWrapper.
 class VisionCacheWrapper:
     """
@@ -394,18 +418,25 @@ class VisionCacheWrapper:
       snapshots.  Image checkpoints are intentionally preserved across turns.
     """
 
-    def __init__(self, model, tokenizer) -> None:
+    def __init__(self, model, tokenizer, model_path=None) -> None:
         """
         Args:
-            model:     VisionModelWrapper, used for prefill forward passes.
-            tokenizer: Model tokenizer, inspected for has_thinking /
-                       think_start_id to compute the checkpoint offset.
+            model:      VisionModelWrapper, used for prefill forward passes.
+            tokenizer:  Model tokenizer, inspected for has_thinking /
+                        think_start_id to compute the checkpoint offset.
+            model_path: Optional path to the model directory.  When provided,
+                        a DiskKVCacheStore is created so that system-prompt KV
+                        snapshots survive across sessions.
         """
         self._lru: LRUPromptCache = LRUPromptCache()
         # tuple[str, ...] → (cache_snapshot, image_end_index: int)
         self._image_checkpoints: dict = {}
         self._model = model
         self._tokenizer = tokenizer
+        self._model_path = str(model_path) if model_path else None
+        self._disk_store: Optional[DiskKVCacheStore] = (
+            DiskKVCacheStore() if model_path else None
+        )
 
     def clear_text(self) -> None:
         """
@@ -775,6 +806,12 @@ class VisionCacheWrapper:
         tokenisation (not the VLM processor's re-encoded ids, which vary
         across turns and cause spurious cache misses).
 
+        Lookup order: in-memory LRU → disk cache → full prefill from scratch.
+
+        When prefilling from scratch, a snapshot is taken at the system-prompt
+        boundary (detected via ChatML) and persisted to disk so that subsequent
+        sessions can skip the expensive system-prompt prefill entirely.
+
         Phase 1: prefill all tokens except the last *checkpoint_offset*
                  ones, in PROMPT_PROCESSING_CHUNK_SIZE-token blocks with
                  eager eval + mx.clear_cache() between chunks.
@@ -796,26 +833,55 @@ class VisionCacheWrapper:
         """
         offset = self._checkpoint_offset(prompt_tokens)
 
+        # 1. In-memory LRU lookup.
         base_cache, rest = self._lru.fetch_nearest_cache("model", prompt_tokens)
-        if base_cache is None:
-            base_cache = make_prompt_cache(self._model.language_model)
-            rest = prompt_tokens
-            # Reset VLM mRoPE state so stale _position_ids / _rope_deltas from
-            # a previous request (possibly with a different sequence length) are
-            # not reused.  These attributes are only reset by mlx-vlm itself when
-            # pixel_values is provided; for text-only prefill we must do it here.
-            lm = self._model.language_model
-            if hasattr(lm, "_rope_deltas"):
-                lm._rope_deltas = None
-            if hasattr(lm, "_position_ids"):
-                lm._position_ids = None
+        is_from_scratch = base_cache is None
+
+        # 2. Disk lookup on LRU miss.
+        if is_from_scratch:
+            if self._disk_store is not None and self._model_path:
+                result = self._disk_store.find_and_load(prompt_tokens, self._model_path)
+                if result is not None:
+                    disk_cache, cached_count = result
+                    base_cache = disk_cache
+                    rest = prompt_tokens[cached_count:]
+                    is_from_scratch = False
+                    # Promote into the in-memory LRU for subsequent turns.
+                    self._lru.insert_cache(
+                        "model",
+                        prompt_tokens[:cached_count],
+                        copy.deepcopy(disk_cache),
+                        checkpoint=True,
+                    )
+            if is_from_scratch:
+                base_cache = make_prompt_cache(self._model.language_model)
+                rest = prompt_tokens
+                # Reset VLM mRoPE state so stale _position_ids / _rope_deltas from
+                # a previous request (possibly with a different sequence length) are
+                # not reused.  These attributes are only reset by mlx-vlm itself when
+                # pixel_values is provided; for text-only prefill we must do it here.
+                lm = self._model.language_model
+                if hasattr(lm, "_rope_deltas"):
+                    lm._rope_deltas = None
+                if hasattr(lm, "_position_ids"):
+                    lm._position_ids = None
         else:
             cached = len(prompt_tokens) - len(rest)
             logger.info(
                 f"[kv-seq] cache hit: {cached}/{len(prompt_tokens)} tokens cached"
             )
 
-        # Prefill rest[:-offset] in chunks
+        # 3. Determine system-prompt boundary for disk snapshot (from-scratch only).
+        boundary_idx = None
+        boundary_cache = None
+        if is_from_scratch and self._disk_store is not None and self._model_path:
+            boundary_idx = _find_system_prompt_boundary(prompt_tokens, self._tokenizer)
+            if boundary_idx is None:
+                # Fallback: use the full checkpoint key as the disk cache key.
+                boundary_idx = len(prompt_tokens) - offset
+
+        # 4. Prefill in chunks.  When saving to disk, split into two sub-phases
+        #    so the snapshot is taken at exactly boundary_idx tokens.
         phase1_len = len(rest) - offset
         cached_tokens = len(prompt_tokens) - len(rest)
 
@@ -826,10 +892,35 @@ class VisionCacheWrapper:
             prefill_tokens_processed=0,
         )
         processed = 0
+
         if phase1_len > 0:
-            phase1_array = mx.array(rest[:phase1_len])
-            for i in range(0, phase1_len, PROMPT_PROCESSING_CHUNK_SIZE):
-                chunk = phase1_array[i : i + PROMPT_PROCESSING_CHUNK_SIZE][None]
+            # Phase 1a: prefill up to boundary_idx for a clean disk snapshot.
+            if (
+                is_from_scratch
+                and boundary_idx is not None
+                and 0 < boundary_idx < phase1_len
+            ):
+                phase1a = mx.array(rest[:boundary_idx])
+                for i in range(0, boundary_idx, PROMPT_PROCESSING_CHUNK_SIZE):
+                    chunk = phase1a[i : i + PROMPT_PROCESSING_CHUNK_SIZE][None]
+                    self._model(chunk, cache=base_cache)
+                    mx.eval([c.state for c in base_cache])
+                    mx.clear_cache()
+                    processed += chunk.shape[1]
+                    if not reporter.update(
+                        is_draft=False,
+                        prefill_tokens_processed=cached_tokens + processed,
+                    ):
+                        raise StopPromptProcessing
+                boundary_cache = copy.deepcopy(base_cache)
+                phase1b_start = boundary_idx
+            else:
+                phase1b_start = 0
+
+            # Phase 1b: prefill from phase1b_start to phase1_len.
+            phase1b = mx.array(rest[phase1b_start:phase1_len])
+            for i in range(0, len(phase1b), PROMPT_PROCESSING_CHUNK_SIZE):
+                chunk = phase1b[i : i + PROMPT_PROCESSING_CHUNK_SIZE][None]
                 self._model(chunk, cache=base_cache)
                 mx.eval([c.state for c in base_cache])
                 mx.clear_cache()
@@ -839,6 +930,7 @@ class VisionCacheWrapper:
                     prefill_tokens_processed=processed,
                 ):
                     raise StopPromptProcessing
+
         reporter.finish(
             is_draft=False,
             prefill_tokens_processed=len(rest),
@@ -850,7 +942,24 @@ class VisionCacheWrapper:
         )
         logger.info(f"[kv-seq] checkpoint saved at len={len(checkpoint_key)}")
 
-        # Phase 2 tokens: processed by stream_generate
+        # 5. Persist to disk on first from-scratch prefill.
+        if is_from_scratch and self._disk_store is not None and self._model_path:
+            if boundary_cache is not None:
+                # boundary_cache is set only inside the phase-1a block, which
+                # requires boundary_idx to be non-None (invariant guaranteed above).
+                self._disk_store.maybe_save(
+                    list(prompt_tokens[:boundary_idx]),
+                    self._model_path,
+                    boundary_cache,
+                )
+            elif boundary_idx is not None and boundary_idx >= phase1_len:
+                # System prompt spans the full phase1 — save the full checkpoint.
+                # Note: this key may include user_msg_1 tokens (documented limitation).
+                self._disk_store.maybe_save(
+                    list(checkpoint_key), self._model_path, base_cache
+                )
+
+        # Phase 2 tokens: processed by stream_generate.
         return base_cache, mx.array(rest[-offset:])
 
     def save_post_prefill_snapshot(self, prompt_tokens: list, cache) -> None:
