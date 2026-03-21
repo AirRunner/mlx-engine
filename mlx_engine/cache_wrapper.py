@@ -13,6 +13,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.server import LRUPromptCache
 
+from mlx_engine.cache_plugins import find_boundary
 from mlx_engine.disk_kv_cache import DiskKVCacheStore
 from mlx_engine.utils.prompt_progress_reporter import (
     PromptProgressReporter,
@@ -364,15 +365,23 @@ class CacheWrapper:
 
 
 def _find_system_prompt_boundary(prompt_tokens: list, tokenizer) -> Optional[int]:
-    """Return the index of the second <|im_start|> token in *prompt_tokens*.
+    """Return the token index to use as the disk-cache key boundary.
 
-    For ChatML-format models this marks the boundary between the system prompt
-    and the first user turn, allowing the disk KV cache to be keyed on the
-    system prompt alone so it matches any future conversation.
+    Strategy (first match wins):
+      1. Plugin detectors (mlx_engine/cache_plugins/): allow client-specific logic,
+         e.g. Open WebUI's stable/dynamic split inside the system prompt.
+      2. Generic ChatML fallback: index of the second <|im_start|> token
+         (boundary between system prompt and first user turn).
 
-    Returns None when the model does not use ChatML or when the sequence does
-    not contain at least two <|im_start|> tokens (e.g. no system prompt).
+    Returns None when no boundary can be determined.
     """
+    # 1. Try registered plugins.
+    result = find_boundary(prompt_tokens, tokenizer)
+    if result is not None:
+        logger.debug(f"[kv-disk] plugin boundary at token {result}")
+        return result
+
+    # 2. Generic ChatML fallback.
     try:
         vocab = tokenizer.get_vocab()
     except Exception:
@@ -909,7 +918,7 @@ class VisionCacheWrapper:
                     processed += chunk.shape[1]
                     if not reporter.update(
                         is_draft=False,
-                        prefill_tokens_processed=cached_tokens + processed,
+                        prefill_tokens_processed=processed,
                     ):
                         raise StopPromptProcessing
                 boundary_cache = copy.deepcopy(base_cache)
