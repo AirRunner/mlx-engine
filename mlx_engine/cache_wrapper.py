@@ -826,6 +826,15 @@ class VisionCacheWrapper:
         if base_cache is None:
             base_cache = make_prompt_cache(self._model.language_model)
             rest = prompt_tokens
+            # Reset VLM mRoPE state so stale _position_ids / _rope_deltas from
+            # a previous request (possibly with a different sequence length) are
+            # not reused.  These attributes are only reset by mlx-vlm itself when
+            # pixel_values is provided; for text-only prefill we must do it here.
+            lm = self._model.language_model
+            if hasattr(lm, "_rope_deltas"):
+                lm._rope_deltas = None
+            if hasattr(lm, "_position_ids"):
+                lm._position_ids = None
         else:
             cached = len(prompt_tokens) - len(rest)
             logger.info(
