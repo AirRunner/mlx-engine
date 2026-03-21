@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path.home() / ".cache" / "mlx-engine" / "kv_cache"
 MIN_TOKENS = 1000
-MAX_CACHE_BYTES = 5 * 1024**3  # 5 GB
+MAX_CACHE_BYTES = 2 * 1024**3  # 2 GB
 
 
 def _sha256_tokens(tokens: list) -> str:
@@ -32,7 +32,7 @@ class DiskKVCacheStore:
     matching can be performed without loading the arrays.
 
     Disk LRU eviction: total cache size is capped at MAX_CACHE_BYTES (default
-    5 GB).  Each entry tracks ``last_used`` (updated on every hit) and
+    2 GB).  Each entry tracks ``last_used`` (updated on every hit) and
     ``file_size``.  When a new save would exceed the cap, the least-recently-
     used entries are deleted first.
     """
