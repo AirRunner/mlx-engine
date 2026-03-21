@@ -49,6 +49,28 @@ def validate_prefill_step_size(prefill_step_size: Optional[int] = None) -> int:
 logger = logging.getLogger(__name__)
 
 
+def _image_block_boundaries(ids_flat: list, img_tok: int, vid_tok: int) -> list:
+    """Return (start, end) index pairs for each contiguous image token block."""
+    boundaries = []
+    in_block = False
+    start = 0
+    for i, tok in enumerate(ids_flat):
+        is_img = tok == img_tok or tok == vid_tok
+        if is_img and not in_block:
+            start, in_block = i, True
+        elif not is_img and in_block:
+            boundaries.append((start, i))
+            in_block = False
+    if in_block:
+        boundaries.append((start, len(ids_flat)))
+    return boundaries
+
+
+def _image_block_lengths(ids_flat: list, img_tok: int, vid_tok: int) -> tuple:
+    """Return the number of image tokens in each contiguous image block, in order."""
+    return tuple(e - s for s, e in _image_block_boundaries(ids_flat, img_tok, vid_tok))
+
+
 class CacheWrapper:
     """
     Wrapper class for the MLX LM cache to maintain an in-memory cache
@@ -418,6 +440,16 @@ class VisionCacheWrapper:
         self._lru = LRUPromptCache()
         mx.clear_cache()
 
+    def clear_image_checkpoints(self) -> None:
+        """Drop all image KV checkpoints and release their Metal buffers.
+
+        The text LRU is intentionally preserved.  Use clear() to drop both.
+        """
+        if self._image_checkpoints:
+            self._image_checkpoints = {}
+            mx.clear_cache()
+            logger.info("[kv-image] all image checkpoints freed")
+
     def clear(self) -> None:
         """Drop all KV snapshots (text-only and image). Callers that only need
         to flush text-only state should prefer clear_text()."""
@@ -426,7 +458,12 @@ class VisionCacheWrapper:
         mx.clear_cache()
 
     def save_image_checkpoint(
-        self, key: tuple, cache_snapshot, image_end_index: int, prefix_hash: int
+        self,
+        key: tuple,
+        cache_snapshot,
+        image_end_index: int,
+        prefix_hash: int,
+        block_lengths: tuple = (),
     ) -> None:
         """
         Persist a KV snapshot taken right after an image block.
@@ -440,17 +477,169 @@ class VisionCacheWrapper:
                              ``input_ids[0, :image_end_index]`` at save time.
                              Used to detect stale checkpoints from a different
                              conversation that happens to share the same images.
+            block_lengths:   Number of image tokens in each block up to and
+                             including this checkpoint, e.g. (782,) or (782, 874).
+                             Used for a fast structural staleness check: if block
+                             lengths differ on the next turn, image tokenization
+                             changed (e.g. dynamic resolution padding) and the
+                             checkpoint must be invalidated before computing hashes.
         """
-        self._image_checkpoints[key] = (cache_snapshot, image_end_index, prefix_hash)
+        self._image_checkpoints[key] = (
+            cache_snapshot,
+            image_end_index,
+            prefix_hash,
+            block_lengths,
+        )
         logger.info(
             f"[kv-image] checkpoint saved depth={len(key)} index={image_end_index}"
         )
 
     def get_image_checkpoint(self, key: tuple):
         """
-        Return ``(cache_snapshot, image_end_index, prefix_hash)`` for *key*, or None.
+        Return ``(cache_snapshot, image_end_index, prefix_hash, block_lengths)``
+        for *key*, or None.
         """
         return self._image_checkpoints.get(key)
+
+    def validate_image_checkpoint(
+        self,
+        check_key: tuple,
+        vlm_ids: mx.array,
+        img_tok: Optional[int],
+        vid_tok: Optional[int],
+        current_block_lengths: tuple,
+    ) -> bool:
+        """Validate a stored image checkpoint against the current token sequence.
+
+        Performs three checks in order:
+
+        1. **Block-length gap check**: when block token counts differ (e.g. due to
+           dynamic resolution re-padding), verifies that all extra tokens in the
+           gap are image-pad tokens.  If so, the checkpoint is still valid because
+           the partial-hit prefill will cover the gap naturally.  Non-pad tokens
+           indicate a real content change and must invalidate the cache.
+        2. **Bounds check**: ``stored_end_idx`` must not exceed the current
+           sequence length.
+        3. **Prefix hash**: the hash of tokens up to ``stored_end_idx`` must match.
+
+        Args:
+            check_key:             Checkpoint key to validate (image hash tuple).
+            vlm_ids:               Full VLM token sequence, shape (1, seq_len).
+            img_tok:               Image pad token ID (``None`` if unavailable).
+            vid_tok:               Video pad token ID (``None`` if unavailable).
+            current_block_lengths: Image block token counts for the current turn.
+
+        Returns:
+            ``True`` if the checkpoint is stale and must be invalidated.
+        """
+        entry = self.get_image_checkpoint(check_key)
+        if entry is None:
+            return False
+
+        _, stored_end_idx, stored_prefix_hash, stored_block_lengths = entry
+        depth = len(check_key)
+
+        # 1. Block-length gap check.
+        # Block lengths can change when dynamic resolution re-pads all images in
+        # a batch to the largest dimensions (e.g. 300→672 tokens when a larger
+        # second image is added).  Extra padding tokens are semantically neutral
+        # and will be processed by the partial-hit prefill from stored_end_idx
+        # onwards.  Only invalidate when the gap contains non-pad tokens,
+        # indicating a real content change.
+        if (
+            stored_block_lengths
+            and current_block_lengths
+            and current_block_lengths[:depth] != stored_block_lengths
+        ):
+            block_bounds = (
+                _image_block_boundaries(vlm_ids[0].tolist(), img_tok, vid_tok)
+                if img_tok is not None
+                else []
+            )
+            if depth > len(block_bounds):
+                logger.info(
+                    f"[kv-image] stale checkpoint (depth={depth}): "
+                    f"sequence has fewer image blocks than checkpoint "
+                    f"({len(block_bounds)} < {depth})"
+                )
+                return True
+            blk_end = block_bounds[depth - 1][1]
+            gap = (
+                vlm_ids[0, stored_end_idx:blk_end].tolist()
+                if stored_end_idx < blk_end
+                else []
+            )
+            if all(t == img_tok or t == vid_tok for t in gap):
+                logger.info(
+                    f"[kv-image] depth={depth}: image block re-padded "
+                    f"({stored_block_lengths[depth - 1]}"
+                    f"→{current_block_lengths[depth - 1]} tokens), "
+                    "checkpoint accepted"
+                )
+            else:
+                logger.info(
+                    f"[kv-image] stale checkpoint (depth={depth}): "
+                    "image block content changed "
+                    f"(stored={stored_block_lengths}, "
+                    f"current={current_block_lengths[:depth]})"
+                )
+                return True
+
+        # 2. Bounds check.
+        if stored_end_idx > vlm_ids.shape[1]:
+            logger.info(
+                f"[kv-image] stale checkpoint (depth={depth}): "
+                f"stored_end_idx={stored_end_idx} exceeds "
+                f"current sequence length {vlm_ids.shape[1]}"
+            )
+            return True
+
+        # 3. Prefix hash.
+        current_hash = hash(tuple(vlm_ids[0, :stored_end_idx].tolist()))
+        if current_hash != stored_prefix_hash:
+            logger.info(
+                f"[kv-image] stale checkpoint (depth={depth}): "
+                f"prefix hash mismatch at position {stored_end_idx}"
+            )
+            return True
+
+        return False
+
+    def save_block_checkpoints(
+        self,
+        hash_chain: tuple,
+        offset: int,
+        block_checkpoints: list,
+        vlm_ids,
+        block_lengths: tuple,
+    ) -> None:
+        """Compute per-block prefix hashes and persist KV checkpoints.
+
+        Abstracts the hash computation and key construction so callers do not
+        need to repeat this logic for both the full-miss and partial-hit paths.
+
+        Args:
+            hash_chain:        Full image hash chain for this turn.
+            offset:            Number of already-cached image blocks.  Zero for
+                               a full miss; ``partial_depth`` for a partial hit.
+                               Checkpoint at index ``i`` is stored under
+                               ``hash_chain[:offset + i + 1]``.
+            block_checkpoints: List of ``(image_end_index, cache_snapshot)``
+                               pairs, one per newly processed image block.
+            vlm_ids:           Full VLM token sequence, shape (1, total_tokens).
+                               Used to compute prefix hashes at each boundary.
+            block_lengths:     Image block token counts for the full turn, used
+                               as a structural staleness check on the next turn.
+        """
+        for i, (end_idx, snap) in enumerate(block_checkpoints):
+            pfx_hash = hash(tuple(vlm_ids[0, :end_idx].tolist()))
+            self.save_image_checkpoint(
+                hash_chain[: offset + i + 1],
+                snap,
+                end_idx,
+                pfx_hash,
+                block_lengths[: offset + i + 1],
+            )
 
     def invalidate_image_checkpoint(self, key: tuple) -> None:
         """
@@ -708,6 +897,84 @@ class VisionCacheWrapper:
             remaining_tokens: tokens not yet in the cache (empty on full hit).
         """
         return self._lru.fetch_nearest_cache("model", prompt_tokens)
+
+    def restore_post_image_cache(
+        self,
+        prompt_tokens: list,
+        image_cache_key: tuple,
+        vlm_input_ids,
+        reporter,
+    ) -> tuple:
+        """Restore the KV cache state for an image full-hit turn.
+
+        Tries the text LRU first to avoid re-prefilling text tokens that were
+        already processed in a previous turn.  Falls back to the image
+        checkpoint + full text prefill when the LRU does not cover the current
+        conversation.
+
+        Three cases, in priority order:
+
+        Exact continuation (lru_rest has 1 token): the LRU snapshot already
+        covers all but the last token; no text prefill needed.
+
+        Partial hit (lru_rest has more than 1 token): the LRU covers most of
+        the conversation; only the delta tokens (new user message, etc.) are
+        prefilled on top of the LRU cache.
+
+        Miss: the image checkpoint is restored and all text tokens after the
+        last image block are prefilled from scratch.
+
+        Args:
+            prompt_tokens:    Full prompt token list, used as the text LRU key.
+                              Must be consistent across turns so snapshots saved
+                              in a previous turn can be retrieved.
+            image_cache_key:  Hash-chain key identifying the image checkpoint.
+            vlm_input_ids:    Full token sequence from the VLM processor,
+                              shape (1, total_tokens).  Used to extract the
+                              text suffix on a cache miss.
+            reporter:         Prompt progress reporter (may raise
+                              StopPromptProcessing on user cancellation).
+
+        Returns:
+            (base_cache, last_token): populated KV cache and the last processed
+            token as an mx.array, ready for stream_generate.
+            last_token may be empty if image_end_index >= sequence length;
+            the caller should fall back to the last VLM token in that case.
+        """
+        lru_cache, lru_rest = self.fetch_continuation_cache(prompt_tokens)
+
+        if lru_cache is not None and len(lru_rest) == 1:
+            logger.info(
+                f"[kv-seq] continuation cache hit "
+                f"({len(prompt_tokens) - 1}/{len(prompt_tokens)} tokens)"
+            )
+            return lru_cache, mx.array(lru_rest)
+
+        if lru_cache is not None and len(lru_rest) > 1:
+            cached_len = len(prompt_tokens) - len(lru_rest)
+            logger.info(
+                f"[kv-seq] continuation partial hit "
+                f"({cached_len}/{len(prompt_tokens)} tokens, "
+                f"prefilling {len(lru_rest)} delta tokens)"
+            )
+            delta_tokens = mx.array(lru_rest)[None]
+            base_cache, last_token = self.prefill_text_after_image(
+                lru_cache, delta_tokens, reporter
+            )
+            self.save_post_prefill_snapshot(prompt_tokens, base_cache)
+            return base_cache, last_token
+
+        # LRU miss (or stale exact match): restore image checkpoint and
+        # prefill all text tokens after the last image block.
+        entry = self.get_image_checkpoint(image_cache_key)
+        cache_snapshot, image_end_index = entry[0], entry[1]
+        base_cache = copy.deepcopy(cache_snapshot)
+        vlm_text_tokens = vlm_input_ids[:, image_end_index:]
+        base_cache, last_token = self.prefill_text_after_image(
+            base_cache, vlm_text_tokens, reporter
+        )
+        self.save_post_prefill_snapshot(prompt_tokens, base_cache)
+        return base_cache, last_token
 
     def fetch_pre_image_cache(
         self, vlm_input_ids_flat: list, img_tok: int, vid_tok: int

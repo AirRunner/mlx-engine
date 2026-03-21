@@ -316,18 +316,19 @@ class TestVisionCacheWrapper(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_save_image_checkpoint_stores_prefix_hash(self):
-        """Saved checkpoint exposes (snapshot, end_idx, prefix_hash) as a 3-tuple."""
+        """Saved checkpoint exposes (snapshot, end_idx, prefix_hash, block_lengths)."""
         wrapper = self._make_wrapper()
         cache = _make_cache()
-        wrapper.save_image_checkpoint(("h1",), cache, 42, 0xDEAD)
+        wrapper.save_image_checkpoint(("h1",), cache, 42, 0xDEAD, (100,))
 
         entry = wrapper.get_image_checkpoint(("h1",))
         self.assertIsNotNone(entry)
-        self.assertEqual(len(entry), 3)
-        snapshot, end_idx, pfx_hash = entry
+        self.assertEqual(len(entry), 4)
+        snapshot, end_idx, pfx_hash, block_lengths = entry
         self.assertIs(snapshot, cache)
         self.assertEqual(end_idx, 42)
         self.assertEqual(pfx_hash, 0xDEAD)
+        self.assertEqual(block_lengths, (100,))
 
     def test_invalidate_image_checkpoint_removes_entry(self):
         """invalidate_image_checkpoint() removes the entry; subsequent lookup returns None."""
@@ -355,7 +356,7 @@ class TestVisionCacheWrapper(unittest.TestCase):
         entry = wrapper.get_image_checkpoint(("img",))
         self.assertIsNotNone(entry)
         # Simulate the validation logic in generate.py
-        _, stored_end, stored_hash = entry
+        _, stored_end, stored_hash, _bl = entry
         current_hash = hash(tuple(ids[:stored_end]))
         self.assertNotEqual(current_hash, stored_hash, "Mismatch should be detected")
 
@@ -369,7 +370,7 @@ class TestVisionCacheWrapper(unittest.TestCase):
         wrapper.save_image_checkpoint(("img",), _make_cache(), end_idx, pfx_hash)
         entry = wrapper.get_image_checkpoint(("img",))
         self.assertIsNotNone(entry)
-        _, stored_end, stored_hash = entry
+        _, stored_end, stored_hash, _bl = entry
         current_hash = hash(tuple(ids[:stored_end]))
         self.assertEqual(current_hash, stored_hash, "Matching hash should pass")
 
