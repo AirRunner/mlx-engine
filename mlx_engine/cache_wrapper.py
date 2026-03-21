@@ -43,6 +43,9 @@ def _image_block_boundaries(ids_flat: list, img_tok: int, vid_tok: int) -> list:
 
 def _image_block_lengths(ids_flat: list, img_tok: int, vid_tok: int) -> tuple:
     """Return the number of image tokens in each contiguous image block, in order."""
+    # TODO: ViT-based models (e.g. Qwen3-VL) use uniform placeholder IDs for image tokens,
+    # so block_lengths is insufficient as a cache key. Incorporate image content (e.g. sha256
+    # of raw bytes) to avoid false cache hits across different images of the same resolution.
     return tuple(e - s for s, e in _image_block_boundaries(ids_flat, img_tok, vid_tok))
 
 
@@ -410,6 +413,10 @@ class VisionCacheWrapper:
 
         Image checkpoints are intentionally left intact so that a cached image
         can still be reused on future turns.
+
+        Note: VisionModelKit is always sequential (max_seq_nums=1), so there is
+        at most one active conversation at a time. Clearing the full LRU here
+        never discards in-flight state from a concurrent request.
         """
         self._lru = LRUPromptCache()
         mx.clear_cache()
