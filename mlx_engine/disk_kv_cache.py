@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import time
 from pathlib import Path
 
 import mlx_lm
@@ -10,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path.home() / ".cache" / "mlx-engine" / "kv_cache"
 MIN_TOKENS = 1000
+MAX_CACHE_BYTES = 5 * 1024**3  # 5 GB
 
 
 def _sha256_tokens(tokens: list) -> str:
@@ -28,6 +30,11 @@ class DiskKVCacheStore:
     Only caches snapshots with at least MIN_TOKENS tokens (default 1000).
     Each entry in the manifest stores the full token list so that prefix
     matching can be performed without loading the arrays.
+
+    Disk LRU eviction: total cache size is capped at MAX_CACHE_BYTES (default
+    5 GB).  Each entry tracks ``last_used`` (updated on every hit) and
+    ``file_size``.  When a new save would exceed the cap, the least-recently-
+    used entries are deleted first.
     """
 
     def __init__(self) -> None:
@@ -79,7 +86,10 @@ class DiskKVCacheStore:
             "model_path": model_path,
             "mlx_lm_version": mlx_lm.__version__,
             "token_count": len(tokens),
+            "file_size": cache_file.stat().st_size,
+            "last_used": time.time(),
         }
+        self._evict_if_needed()
         self._save_manifest()
         logger.info(f"[kv-disk] saved len={len(tokens)} → {sha[:8]}...")
 
@@ -120,12 +130,36 @@ class DiskKVCacheStore:
             logger.warning(f"[kv-disk] load failed: {e}")
             return None
 
+        self._manifest[best_sha]["last_used"] = time.time()
+        self._save_manifest()
         logger.info(f"[kv-disk] hit: {best_len}/{len(prompt_tokens)} tokens")
         return cache, best_len
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _evict_if_needed(self) -> None:
+        """Delete least-recently-used entries until total size is below MAX_CACHE_BYTES."""
+        total = sum(e.get("file_size", 0) for e in self._manifest.values())
+        if total <= MAX_CACHE_BYTES:
+            return
+
+        # Sort by last_used ascending (oldest first); entries without last_used evicted first.
+        by_age = sorted(
+            self._manifest.items(), key=lambda kv: kv[1].get("last_used", 0)
+        )
+        for sha, entry in by_age:
+            if total <= MAX_CACHE_BYTES:
+                break
+            cache_file = CACHE_DIR / f"{sha}.safetensors"
+            try:
+                cache_file.unlink(missing_ok=True)
+            except Exception as e:
+                logger.warning(f"[kv-disk] evict unlink failed {sha[:8]}: {e}")
+            total -= entry.get("file_size", 0)
+            del self._manifest[sha]
+            logger.info(f"[kv-disk] evicted {sha[:8]} (LRU, freed {entry.get('file_size', 0) // 1024**2} MB)")
 
     def _save_manifest(self) -> None:
         try:
