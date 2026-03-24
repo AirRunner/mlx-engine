@@ -62,11 +62,15 @@ class DiskKVCacheStore:
 
         sha = _sha256_tokens(tokens)
 
+        cache_file = CACHE_DIR / f"{sha}.safetensors"
+
         # Skip if already saved for this model
         if sha in self._manifest and self._manifest[sha]["model_path"] == model_path:
-            return
-
-        cache_file = CACHE_DIR / f"{sha}.safetensors"
+            if cache_file.exists():
+                return
+            # Orphaned manifest entry (file deleted manually): remove and re-save
+            logger.warning(f"[kv-disk] orphaned manifest entry {sha[:8]}, re-saving")
+            del self._manifest[sha]
         try:
             save_prompt_cache(
                 str(cache_file),
