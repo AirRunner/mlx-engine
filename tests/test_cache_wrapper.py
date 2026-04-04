@@ -242,7 +242,7 @@ class TestVisionCacheWrapper(unittest.TestCase):
         """LRU prefix exactly matches text before first image block."""
         wrapper = self._make_wrapper()
         # Manually insert a cache for the pre-image prefix [1, 2, 3]
-        wrapper._lru.insert_cache("model", [1, 2, 3], _make_cache(), checkpoint=True)
+        wrapper._lru.insert_cache("model", [1, 2, 3], _make_cache(), cache_type="system")
 
         flat_ids = [1, 2, 3, 9999, 100, 101]  # image token at index 3
         cache, rest, first_img = wrapper.fetch_pre_image_cache(flat_ids, 9999, 9999)
@@ -254,7 +254,7 @@ class TestVisionCacheWrapper(unittest.TestCase):
     def test_fetch_pre_image_cache_partial_hit(self):
         """LRU covers a prefix shorter than the pre-image text → rest is non-empty."""
         wrapper = self._make_wrapper()
-        wrapper._lru.insert_cache("model", [1, 2], _make_cache(), checkpoint=True)
+        wrapper._lru.insert_cache("model", [1, 2], _make_cache(), cache_type="system")
 
         flat_ids = [1, 2, 3, 9999, 100]
         cache, rest, first_img = wrapper.fetch_pre_image_cache(flat_ids, 9999, 9999)
@@ -277,7 +277,7 @@ class TestVisionCacheWrapper(unittest.TestCase):
         """Image token at index 0: no pre-image text, no LRU lookup attempted."""
         wrapper = self._make_wrapper()
         # Insert something in LRU to verify it is NOT consulted
-        wrapper._lru.insert_cache("model", [9999], _make_cache(), checkpoint=True)
+        wrapper._lru.insert_cache("model", [9999], _make_cache(), cache_type="system")
 
         flat_ids = [9999, 1, 2, 3]
         cache, rest, first_img = wrapper.fetch_pre_image_cache(flat_ids, 9999, 9999)
@@ -299,7 +299,7 @@ class TestVisionCacheWrapper(unittest.TestCase):
     def test_fetch_pre_image_cache_video_token(self):
         """Video tokens (vid_tok ≠ img_tok) are treated as image boundaries."""
         wrapper = self._make_wrapper()
-        wrapper._lru.insert_cache("model", [1, 2], _make_cache(), checkpoint=True)
+        wrapper._lru.insert_cache("model", [1, 2], _make_cache(), cache_type="system")
 
         img_tok, vid_tok = 9999, 8888
         flat_ids = [1, 2, 8888, 100]  # video token at index 2

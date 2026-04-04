@@ -14,7 +14,7 @@ from pathlib import Path
 from queue import Queue
 from queue import Empty as QueueEmpty
 import time
-from mlx_lm.server import LRUPromptCache
+from mlx_lm.models.cache import LRUPromptCache
 from mlx_engine.utils.token import Token
 
 from mlx_engine.model_kit.batched_model_kit_types import (

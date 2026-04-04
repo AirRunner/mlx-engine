@@ -7,11 +7,11 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.generate import generation_stream, maybe_quantize_kv_cache
 from mlx_lm.models.cache import (
+    LRUPromptCache,
     can_trim_prompt_cache,
     make_prompt_cache,
     trim_prompt_cache,
 )
-from mlx_lm.server import LRUPromptCache
 
 from mlx_engine.utils.prompt_progress_reporter import (
     PromptProgressReporter,
@@ -872,7 +872,7 @@ class VisionCacheWrapper:
 
         checkpoint_key = prompt_tokens[:-offset]
         self._lru.insert_cache(
-            "model", checkpoint_key, copy.deepcopy(base_cache), checkpoint=True
+            "model", checkpoint_key, copy.deepcopy(base_cache), cache_type="system"
         )
         logger.info(f"[kv-seq] checkpoint saved at len={len(checkpoint_key)}")
 
@@ -898,7 +898,7 @@ class VisionCacheWrapper:
         offset = self._checkpoint_offset(prompt_tokens)
         checkpoint_key = prompt_tokens[:-offset]
         self._lru.insert_cache(
-            "model", checkpoint_key, copy.deepcopy(cache), checkpoint=True
+            "model", checkpoint_key, copy.deepcopy(cache), cache_type="system"
         )
         logger.info(f"[kv-seq] post-image snapshot saved len={len(checkpoint_key)}")
 
