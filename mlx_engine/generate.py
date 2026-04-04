@@ -100,8 +100,8 @@ def _inject_pre_image_cache(model_kit: "VisionModelKit", vlm_ids) -> None:
 
     if pre_rest:
         rest_arr = mx.array(pre_rest)
-        for i in range(0, len(pre_rest), PROMPT_PROCESSING_CHUNK_SIZE):
-            chunk = rest_arr[i : i + PROMPT_PROCESSING_CHUNK_SIZE][None]
+        for i in range(0, len(pre_rest), model_kit.prefill_step_size):
+            chunk = rest_arr[i : i + model_kit.prefill_step_size][None]
             model_kit.model.language_model(chunk, cache=pre_cache)
             mx.eval([c.state for c in pre_cache])
             mx.clear_cache()
