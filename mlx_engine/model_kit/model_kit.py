@@ -108,6 +108,8 @@ class ModelKit:
             kv_group_size=kv_group_size,
             quantized_kv_start=quantized_kv_start,
             chunk_size=prefill_step_size,
+            model_path=str(model_path),
+            tokenizer=self.tokenizer,
         )
         self.kv_bits = kv_bits
         self.kv_group_size = kv_group_size

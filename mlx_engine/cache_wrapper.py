@@ -17,6 +17,8 @@ from mlx_lm.models.cache import (
     trim_prompt_cache,
 )
 
+from mlx_engine.cache_plugins import find_boundary
+from mlx_engine.disk_kv_cache import DiskKVCacheStore
 from mlx_engine.utils.prompt_progress_reporter import (
     PromptProgressReporter,
     StopPromptProcessing,
@@ -67,6 +69,39 @@ def _vram_str(kv_cache: list | None = None) -> str:
     return f"VRAM {total} MB (active={active} cache={alloc_cache})"
 
 
+def _find_system_prompt_boundary(
+    prompt_tokens: list, tokenizer
+) -> tuple[Optional[int], Optional[str]]:
+    """Return (boundary_index, plugin_name) for the disk-cache key.
+
+    Strategy (first match wins):
+      1. Plugin detectors (mlx_engine/cache_plugins/): allow client-specific logic,
+         e.g. Open WebUI's stable/dynamic split inside the system prompt.
+      2. Generic ChatML fallback: index of the second <|im_start|> token
+         (boundary between system prompt and first user turn).
+
+    Returns (None, None) when no boundary can be determined.
+    """
+    # 1. Try registered plugins.
+    result, plugin_name = find_boundary(prompt_tokens, tokenizer)
+    if result is not None:
+        logger.debug(f"[kv-disk] plugin boundary at token {result}")
+        return result, plugin_name
+
+    # 2. Generic ChatML fallback.
+    try:
+        vocab = tokenizer.get_vocab()
+    except Exception:
+        return None, None
+    im_start_id = vocab.get("<|im_start|>")
+    if im_start_id is None:
+        return None, None
+    positions = [i for i, t in enumerate(prompt_tokens) if t == im_start_id]
+    if len(positions) < 2:
+        return None, None
+    return positions[1], None
+
+
 class CacheWrapper:
     def __init__(
         self,
@@ -79,6 +114,7 @@ class CacheWrapper:
         chunk_size: int,
         checkpoint_tail_tokens: int = DEFAULT_CHECKPOINT_TAIL_TOKENS,
         history_capacity: int = 10,
+        model_path: Optional[str] = None,
         tokenizer=None,
     ):
         self.model = model
@@ -106,7 +142,11 @@ class CacheWrapper:
         # Optional image checkpoint store, activated by ModelKit when a
         # VisionAddOn is present.
         self._image_store: Optional["ImageCheckpointStore"] = None
+        self._model_path: Optional[str] = str(model_path) if model_path else None
         self._tokenizer = tokenizer
+        self._disk_store: Optional[DiskKVCacheStore] = (
+            DiskKVCacheStore() if model_path else None
+        )
 
     @property
     def cache(self) -> List[Any]:
@@ -400,12 +440,25 @@ class CacheWrapper:
             self.finalize_generation()
 
         restored_cache, uncached_tokens = self._restore_cache(prompt_tokens)
+
+        # Disk fallback when LRU and prev-checkpoint both miss.
+        if restored_cache is None and self._disk_store is not None and self._model_path:
+            result = self._disk_store.find_and_load(token_list, self._model_path)
+            if result is not None:
+                disk_cache, cached_count = result
+                restored_cache = disk_cache
+                uncached_tokens = prompt_tokens[cached_count:]
+                logger.info(
+                    f"[kv-disk] restored {cached_count}/{total_prompt_tokens} tokens"
+                )
+
         self._live_cache = (
             restored_cache if restored_cache is not None else self._make_cache()
         )
         self._live_tokens = prompt_tokens
 
         cached_tokens = total_prompt_tokens - len(uncached_tokens)
+        is_from_scratch = cached_tokens == 0
         logger.info(
             "Prompt cache: using %d/%d tokens from cache",
             cached_tokens,
@@ -435,6 +488,21 @@ class CacheWrapper:
         if self._draft_model is not None:
             checkpoint_prefix_len = None
 
+        # Disk save: determine boundary only on cold start (no draft model).
+        boundary_idx: Optional[int] = None
+        plugin_name: Optional[str] = None
+        if (
+            is_from_scratch
+            and self._draft_model is None
+            and self._disk_store is not None
+            and self._model_path is not None
+        ):
+            boundary_idx, plugin_name = _find_system_prompt_boundary(
+                token_list, self._tokenizer
+            )
+            if boundary_idx is None:
+                boundary_idx = total_prompt_tokens - num_tokens_to_exclude
+
         with mx.stream(generation_stream):
             try:
                 if self._draft_model is not None:
@@ -450,15 +518,47 @@ class CacheWrapper:
                     )
 
                 main_cache = self._live_cache[: len(self.model.layers)]
-                self._prefill_cache(
-                    model=self.model,
-                    cache=main_cache,
-                    cache_start=0,
-                    tokens=prefill_tokens,
-                    reporter=reporter,
-                    is_draft=False,
-                    checkpoint_prefix_len=checkpoint_prefix_len,
-                )
+                if boundary_idx is not None and 0 < boundary_idx < len(prefill_tokens):
+                    # Split prefill at disk boundary: save snapshot between the two halves.
+                    self._prefill_cache(
+                        model=self.model,
+                        cache=main_cache,
+                        cache_start=0,
+                        tokens=prefill_tokens[:boundary_idx],
+                        reporter=reporter,
+                        is_draft=False,
+                        checkpoint_prefix_len=checkpoint_prefix_len,
+                    )
+                    self._disk_store.maybe_save(
+                        token_list[:boundary_idx], self._model_path, main_cache, plugin_name
+                    )
+                    self._prefill_cache(
+                        model=self.model,
+                        cache=main_cache,
+                        cache_start=0,
+                        tokens=prefill_tokens[boundary_idx:],
+                        reporter=reporter,
+                        is_draft=False,
+                        checkpoint_prefix_len=checkpoint_prefix_len,
+                    )
+                else:
+                    self._prefill_cache(
+                        model=self.model,
+                        cache=main_cache,
+                        cache_start=0,
+                        tokens=prefill_tokens,
+                        reporter=reporter,
+                        is_draft=False,
+                        checkpoint_prefix_len=checkpoint_prefix_len,
+                    )
+                    # Boundary at or after end of prefill: save after full prefill.
+                    if boundary_idx is not None:
+                        self._disk_store.maybe_save(
+                            token_list[: total_prompt_tokens - num_tokens_to_exclude],
+                            self._model_path,
+                            main_cache,
+                            plugin_name,
+                        )
             except StopPromptProcessing:
                 if (
                     self._prefill_checkpoint is None
