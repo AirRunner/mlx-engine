@@ -42,7 +42,7 @@ def common_process_prompt_with_images(
     detokenizer.finalize()
     prompt = detokenizer.text
 
-    logger.info(f"Prompt dump: {prompt}\n")
+    logger.debug(f"Prompt dump: {prompt}\n")
 
     images = convert_to_pil(images_b64)
     images = custom_resize(images, max_size=max_size)
