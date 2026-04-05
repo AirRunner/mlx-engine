@@ -18,7 +18,11 @@ import threading
 from mlx_engine.utils.kv_cache_quantization import get_kv_cache_quantization_params
 from mlx_lm.generate import stream_generate
 from mlx_lm.utils import load as mlx_lm_load
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.cache import (
+    can_trim_prompt_cache,
+    make_prompt_cache,
+    trim_prompt_cache,
+)
 
 from mlx_engine.model_kit.model_kit import ModelKit
 from mlx_engine.vision_model_kit.vision_model_kit import VisionModelKit
@@ -47,6 +51,7 @@ from mlx_engine.cache_wrapper import (
     image_block_boundaries,
     image_block_lengths,
     ImageCheckpointStore,
+    CacheWrapper,
 )
 from mlx_engine.utils.prompt_progress_reporter import (
     BatchedMlxLmReporterAdapter,
@@ -408,25 +413,86 @@ def _hash_images(images_b64: list) -> tuple:
     return tuple(hashlib.sha256(img.encode()).hexdigest() for img in images_b64)
 
 
+def _try_inject_pre_image_cache(
+    model_kit: ModelKit,
+    input_ids_list: list,
+    img_tok: int,
+    vid_tok: Optional[int],
+) -> tuple:
+    """Try to reuse pre-image KV state from CacheWrapper to seed the miss prefill.
+
+    Finds the common prefix between CacheWrapper.tokens and the tokens that
+    precede the first image block in input_ids_list.  If a non-empty prefix
+    is found, returns a deepcopy of the cache trimmed to that prefix so the
+    prefill can start from there instead of position 0.
+
+    Returns:
+        (trimmed_cache, n_cached_tokens) or (None, 0) when no reuse is possible.
+    """
+    cw = getattr(model_kit, "cache_wrapper", None)
+    if cw is None or cw.tokens is None:
+        return None, 0
+
+    first_img = next(
+        (i for i, t in enumerate(input_ids_list) if t == img_tok or t == vid_tok),
+        None,
+    )
+    if first_img is None or first_img == 0:
+        return None, 0
+
+    pre_image = mx.array(input_ids_list[:first_img])
+    common = CacheWrapper._find_common_prefix(
+        cw.tokens, pre_image, num_tokens_to_exclude=1
+    )
+    if common == 0:
+        return None, 0
+
+    n_cached = cw._get_num_tokens_in_cache()
+    if n_cached is None:
+        return None, 0
+
+    cache = copy.deepcopy(cw.cache)
+    if not can_trim_prompt_cache(cache):
+        return None, 0
+
+    if n_cached > common:
+        trim_prompt_cache(cache, n_cached - common)
+
+    logger.info(f"[kv-image] pre-image cache injected: {common} tokens reused")
+    return cache, common
+
+
 def _prefill_modelkit_with_image_checkpoints(
     model_kit: ModelKit,
     input_ids: mx.array,
     embeddings: mx.array,
     image_boundaries: list,
     reporter: PromptProgressReporter,
+    *,
+    initial_cache: Optional[list] = None,
+    cached_tokens: int = 0,
+    base_offset: int = 0,
 ) -> tuple:
     """Chunked prefill saving a KV snapshot after each image block.
 
     Args:
         model_kit:        Loaded ModelKit instance.
-        input_ids:        Merged token ids, shape (seq_len,).
+        input_ids:        Token ids to prefill, shape (seq_len,). May be a suffix
+                          when initial_cache is provided (partial hit / pre-image injection).
         embeddings:       Merged embeddings, shape (seq_len, dim).
-        image_boundaries: (start, end_exclusive) pairs from image_block_boundaries.
+        image_boundaries: (start, end_exclusive) pairs relative to input_ids.
         reporter:         Progress reporter.
+        initial_cache:    Pre-populated KV cache to start from (partial hit /
+                          pre-image injection). If None, a fresh cache is created.
+        cached_tokens:    Tokens already covered by initial_cache. Used to report
+                          accurate progress and as base for total_prompt_tokens.
+        base_offset:      Added to each snapshot's image_end_index so stored
+                          indices are absolute (relative to the full VLM sequence).
 
     Returns:
         (cache, block_checkpoints) where block_checkpoints is a list of
-        (image_end_index, cache_snapshot) pairs, one per image block.
+        (image_end_index, cache_snapshot) pairs with absolute indices, one per
+        image block in input_ids.
     """
     total = input_ids.shape[0]
     prefill_len = total - 1  # stream_generate handles the last token
@@ -434,14 +500,18 @@ def _prefill_modelkit_with_image_checkpoints(
     snap_set = {end for _, end in image_boundaries if end <= prefill_len}
     snap_list = sorted(snap_set)
 
-    cache = make_prompt_cache(model_kit.model)
+    cache = (
+        initial_cache
+        if initial_cache is not None
+        else make_prompt_cache(model_kit.model)
+    )
     block_checkpoints = []
     chunk_size = model_kit.prefill_step_size
 
     reporter.begin(
         is_draft=False,
-        cached_tokens=0,
-        total_prompt_tokens=total,
+        cached_tokens=cached_tokens,
+        total_prompt_tokens=total + cached_tokens,
         prefill_tokens_processed=0,
     )
 
@@ -462,7 +532,7 @@ def _prefill_modelkit_with_image_checkpoints(
         processed += end - i
 
         if end in snap_set:
-            block_checkpoints.append((end, copy.deepcopy(cache)))
+            block_checkpoints.append((end + base_offset, copy.deepcopy(cache)))
 
         if not reporter.update(is_draft=False, prefill_tokens_processed=processed):
             raise StopPromptProcessing
@@ -484,13 +554,17 @@ def _process_modelkit_image_cache(
 ) -> tuple:
     """Handle image prompts with KV cache for ModelKit (Qwen3.5 dense and MoE).
 
-    On full cache hit: skips the vision tower, restores the KV snapshot, and
-    prefills only the text suffix that follows the last image block.
-    On miss: runs the full vision tower, prefills with per-image checkpoints,
-    and persists them for subsequent turns.
+    Full hit:    skips the vision tower entirely, restores the KV snapshot,
+                 prefills only the text suffix after the last image block.
+    Partial hit: restores the deepest checkpoint, runs the ViT only on new
+                 images, prefills the suffix from that point, saves new snapshots.
+    Miss:        runs the full vision tower with optional pre-image KV reuse,
+                 prefills with per-image checkpoints, persists them.
 
-    Sets generate_args["prompt_cache"] in both paths.
-    Returns (input_tokens, input_embeddings) for stream_generate.
+    Sets generate_args["prompt_cache"] in all paths.
+    Returns (input_tokens, input_embeddings, full_input_ids) for stream_generate.
+    full_input_ids is the complete VLM token array (used post-generation to
+    update CacheWrapper for the next turn's prefix reuse).
     """
     vision_add_on = model_kit.vision_add_on
     vision_add_on.clear_prediction_state(model_kit.model)
@@ -504,30 +578,27 @@ def _process_modelkit_image_cache(
     hash_chain = tuple(image_hashes)
 
     # Cheap CPU step: tokenize + resize, no ViT. Sets rope_deltas on text_model.
-    input_ids, _, _, position_ids = vision_add_on._prepare_inputs(
+    # Keep grid_thw and pixel_values for partial hit path.
+    input_ids, grid_thw, pixel_values, position_ids = vision_add_on._prepare_inputs(
         model_kit.model, prompt_tokens, images_b64, max_image_size
     )
     input_ids_list = input_ids.tolist()
+    img_tok = vision_add_on.config.image_token_id
     vid_tok = getattr(vision_add_on.config, "video_token_id", None)
-    block_lengths = image_block_lengths(
-        input_ids_list, vision_add_on.config.image_token_id, vid_tok
-    )
+    block_lengths = image_block_lengths(input_ids_list, img_tok, vid_tok)
 
     # Invalidate stale checkpoints (prefix hash mismatch or block length change).
     for depth in range(len(hash_chain), 0, -1):
         key = hash_chain[:depth]
         if image_store.validate_image_checkpoint(
-            key,
-            input_ids_list,
-            vision_add_on.config.image_token_id,
-            vid_tok,
-            block_lengths,
+            key, input_ids_list, img_tok, vid_tok, block_lengths
         ):
             image_store.invalidate_image_checkpoint(key)
 
     hit = image_store.find_deepest_image_checkpoint(hash_chain)
     is_full_hit = hit is not None and hit[0] == hash_chain
 
+    # --- Full hit path ---
     if is_full_hit:
         _, cache_snapshot, image_end_index = hit
         cache = copy.deepcopy(cache_snapshot)
@@ -560,25 +631,122 @@ def _process_modelkit_image_cache(
             f"[kv-image] cache hit depth={len(hash_chain)}"
             f" cached={image_end_index}/{len(input_ids_list)} tokens"
         )
-        return input_ids[-1:], None
+        return input_ids[-1:], None, input_ids
 
-    # Miss path: run the full vision tower, then chunked prefill with snapshots.
+    # --- Partial hit path ---
+    is_partial_hit = hit is not None
+    if is_partial_hit:
+        hit_key, hit_cache_snapshot, hit_image_end_index = hit
+        partial_depth = len(hit_key)
+
+        # Compute pixel patch boundaries per image to slice pixel_values.
+        grid_list = grid_thw.tolist()
+        if len(grid_list) == 3 and isinstance(grid_list[0], int):
+            grid_list = [grid_list]  # single image: normalise to [[T, H, W]]
+        patches_per_image = [t * h * w for t, h, w in grid_list]
+        pixel_start = sum(patches_per_image[:partial_depth])
+        new_pixel_values = pixel_values[pixel_start:]
+        new_grid_thw = grid_thw[partial_depth:]
+
+        # Embed text tokens of the suffix (image token positions will be replaced).
+        suffix_input_ids = input_ids[hit_image_end_index:]
+        suffix_embeds = model_kit.model.language_model.model.embed_tokens(
+            suffix_input_ids[None]
+        )
+        if new_pixel_values.dtype != suffix_embeds.dtype:
+            new_pixel_values = new_pixel_values.astype(suffix_embeds.dtype)
+
+        # Run ViT only on the new images.
+        hidden_states, _ = vision_add_on.vision_tower(
+            new_pixel_values, new_grid_thw, output_hidden_states=False
+        )
+
+        # Merge new image features into the suffix embeddings.
+        final_embeds, _ = vision_add_on.model_cls.merge_input_ids_with_image_features(
+            hidden_states,
+            suffix_embeds,
+            suffix_input_ids[None],
+            img_tok,
+            vid_tok,
+        )
+        final_embeds = final_embeds.squeeze(0)
+
+        # Restore MRoPE state and checkpoint.
+        if position_ids is not None:
+            model_kit.model.language_model.model.position_ids = position_ids
+        cache = copy.deepcopy(hit_cache_snapshot)
+
+        # Boundaries relative to suffix_input_ids.
+        all_boundaries = image_block_boundaries(input_ids_list, img_tok, vid_tok)
+        suffix_boundaries = [
+            (s - hit_image_end_index, e - hit_image_end_index)
+            for s, e in all_boundaries
+            if e > hit_image_end_index
+        ]
+
+        cache, new_checkpoints = _prefill_modelkit_with_image_checkpoints(
+            model_kit,
+            suffix_input_ids,
+            final_embeds,
+            suffix_boundaries,
+            reporter,
+            initial_cache=cache,
+            cached_tokens=hit_image_end_index,
+            base_offset=hit_image_end_index,
+        )
+        image_store.save_block_checkpoints(
+            hash_chain, partial_depth, new_checkpoints, input_ids_list, block_lengths
+        )
+
+        generate_args["prompt_cache"] = cache
+        logger.info(
+            f"[kv-image] partial hit depth={partial_depth}/{len(hash_chain)}"
+            f" cached={hit_image_end_index}/{len(input_ids_list)} tokens"
+        )
+        return input_ids[-1:], final_embeds[-1:], input_ids
+
+    # --- Miss path ---
     # compute_embeddings calls _prepare_inputs again (cheap) and sets position_ids.
     input_ids, embeddings = vision_add_on.compute_embeddings(
         model_kit.model, prompt_tokens, images_b64, max_image_size
     )
-    image_boundaries = image_block_boundaries(
-        input_ids.tolist(), vision_add_on.config.image_token_id, vid_tok
+    ids_list = input_ids.tolist()
+    image_boundaries = image_block_boundaries(ids_list, img_tok, vid_tok)
+
+    # Try to reuse pre-image KV state from CacheWrapper (e.g. system-prompt tokens).
+    pre_cache, pre_cached = _try_inject_pre_image_cache(
+        model_kit, ids_list, img_tok, vid_tok
     )
-    cache, block_checkpoints = _prefill_modelkit_with_image_checkpoints(
-        model_kit, input_ids, embeddings, image_boundaries, reporter
-    )
+
+    if pre_cache is not None:
+        suffix_ids = input_ids[pre_cached:]
+        suffix_embs = embeddings[pre_cached:]
+        suffix_bounds = [
+            (s - pre_cached, e - pre_cached)
+            for s, e in image_boundaries
+            if e > pre_cached
+        ]
+        cache, block_checkpoints = _prefill_modelkit_with_image_checkpoints(
+            model_kit,
+            suffix_ids,
+            suffix_embs,
+            suffix_bounds,
+            reporter,
+            initial_cache=pre_cache,
+            cached_tokens=pre_cached,
+            base_offset=pre_cached,
+        )
+    else:
+        cache, block_checkpoints = _prefill_modelkit_with_image_checkpoints(
+            model_kit, input_ids, embeddings, image_boundaries, reporter
+        )
+
     image_store.save_block_checkpoints(
-        hash_chain, 0, block_checkpoints, input_ids.tolist(), block_lengths
+        hash_chain, 0, block_checkpoints, ids_list, block_lengths
     )
 
     generate_args["prompt_cache"] = cache
-    return input_ids[-1:], embeddings[-1:]
+    return input_ids[-1:], embeddings[-1:], input_ids
 
 
 def _sequential_generation(
@@ -643,16 +811,19 @@ def _sequential_generation(
         # Process prompt
         image_store = _get_image_store(model_kit)
         image_cache_prefill_done = False
+        full_input_ids = None  # set when image cache path is used; needed for post-generation CacheWrapper update
         try:
             if images_b64 and image_store is not None:
-                input_tokens, input_embeddings = _process_modelkit_image_cache(
-                    model_kit,
-                    image_store,
-                    prompt_tokens,
-                    images_b64,
-                    max_image_size,
-                    generate_args,
-                    prompt_progress_reporter,
+                input_tokens, input_embeddings, full_input_ids = (
+                    _process_modelkit_image_cache(
+                        model_kit,
+                        image_store,
+                        prompt_tokens,
+                        images_b64,
+                        max_image_size,
+                        generate_args,
+                        prompt_progress_reporter,
+                    )
                 )
                 image_cache_prefill_done = True
             else:
@@ -703,6 +874,8 @@ def _sequential_generation(
         # Keep track of tokens buffered by detokenizer to yield accurate generation results
         token_buffer: List[Token] = []
         top_logprobs_buffer: List[List[Token]] = []
+        # Accumulate generated token ids for post-image CacheWrapper update.
+        generated_tokens_list: List[int] = []
 
         tokenizer = model_kit.tokenizer
 
@@ -759,6 +932,9 @@ def _sequential_generation(
             if model_kit.is_cross_prompt_cache_active():
                 model_kit.record_token_to_cache(token)
 
+            if image_cache_prefill_done:
+                generated_tokens_list.append(token)
+
             logprobs = generation_result.logprobs
             token_buffer.append(
                 Token(
@@ -807,6 +983,17 @@ def _sequential_generation(
                 text = ""
         if cancel_event.is_set() or model_kit.is_shutdown():
             yield construct_user_cancelled_result()
+            return
+
+        # Update CacheWrapper after an image turn so the next turn can find a
+        # common prefix and avoid re-prefilling from scratch.
+        if image_cache_prefill_done and full_input_ids is not None:
+            cw = getattr(model_kit, "cache_wrapper", None)
+            if cw is not None:
+                all_ids = full_input_ids.tolist() + generated_tokens_list
+                cw.tokens = mx.array(all_ids)
+                cw.cache = generate_args["prompt_cache"]
+                model_kit._cross_prompt_cache_active = True
         return
 
 
