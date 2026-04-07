@@ -933,83 +933,79 @@ def _sequential_generation(
             **generate_args,
         )
 
-        while not model_kit.is_shutdown() and not cancel_event.is_set():
-            try:
-                generation_result = next(stream)
-            except StopIteration:
-                break
-            except StopPromptProcessing:
+        try:
+            while not model_kit.is_shutdown() and not cancel_event.is_set():
+                try:
+                    generation_result = next(stream)
+                except StopIteration:
+                    break
+                except StopPromptProcessing:
+                    yield construct_user_cancelled_result()
+                    return
+
+                # Token processor
+                token = generation_result.token
+                text += generation_result.text
+
+                # record generated token to cache, if cache is active
+                if model_kit.is_cross_prompt_cache_active():
+                    model_kit.record_token_to_cache(token)
+
+                logprobs = generation_result.logprobs
+                token_buffer.append(
+                    Token(
+                        token,
+                        tokenizer.decode(token),
+                        float(logprobs[token]),
+                        from_draft=generation_result.from_draft,
+                    )
+                )
+                if top_logprobs:
+                    top_logprobs_buffer.append(
+                        summarize_top_logprobs(tokenizer, logprobs, top_logprobs)
+                    )
+
+                # Stop processor
+                should_stop, should_buffer, stop_result = process_stop_string_check(
+                    stop_string_processor, token
+                )
+                if should_stop:
+                    yield _handle_stop_string_detected(
+                        tokenizer,
+                        stop_result,
+                        text,
+                        token_buffer,
+                        top_logprobs_buffer,
+                    )
+                    break  # stop generation
+
+                # If we currently have generated a partial match with a stop sequence, or detected an
+                # in-progress multi-byte string, generate new tokens until we know if the stop sequence
+                # is hit or not (i.e., make sure not to yield yet)
+                if should_buffer:
+                    continue
+
+                # Standard yield - yield when a non-empty text segment is available or eos token is hit
+                should_yield, stop_condition = should_yield_token(text, token, tokenizer)
+                if should_yield:
+                    yield GenerationResult(
+                        text=text,
+                        tokens=token_buffer,
+                        stop_condition=stop_condition,
+                        top_logprobs=top_logprobs_buffer,
+                    )
+                    token_buffer = []
+                    top_logprobs_buffer = []
+                    text = ""
+            if cancel_event.is_set() or model_kit.is_shutdown():
                 yield construct_user_cancelled_result()
-                cw = getattr(model_kit, "cache_wrapper", None)
-                if cw is not None and not image_cache_prefill_done:
-                    cw.finalize_generation()
                 return
-
-            # Token processor
-            token = generation_result.token
-            text += generation_result.text
-
-            # record generated token to cache, if cache is active
-            if model_kit.is_cross_prompt_cache_active():
-                model_kit.record_token_to_cache(token)
-
-            logprobs = generation_result.logprobs
-            token_buffer.append(
-                Token(
-                    token,
-                    tokenizer.decode(token),
-                    float(logprobs[token]),
-                    from_draft=generation_result.from_draft,
-                )
-            )
-            if top_logprobs:
-                top_logprobs_buffer.append(
-                    summarize_top_logprobs(tokenizer, logprobs, top_logprobs)
-                )
-
-            # Stop processor
-            should_stop, should_buffer, stop_result = process_stop_string_check(
-                stop_string_processor, token
-            )
-            if should_stop:
-                yield _handle_stop_string_detected(
-                    tokenizer,
-                    stop_result,
-                    text,
-                    token_buffer,
-                    top_logprobs_buffer,
-                )
-                break  # stop generation
-
-            # If we currently have generated a partial match with a stop sequence, or detected an
-            # in-progress multi-byte string, generate new tokens until we know if the stop sequence
-            # is hit or not (i.e., make sure not to yield yet)
-            if should_buffer:
-                continue
-
-            # Standard yield - yield when a non-empty text segment is available or eos token is hit
-            should_yield, stop_condition = should_yield_token(text, token, tokenizer)
-            if should_yield:
-                yield GenerationResult(
-                    text=text,
-                    tokens=token_buffer,
-                    stop_condition=stop_condition,
-                    top_logprobs=top_logprobs_buffer,
-                )
-                token_buffer = []
-                top_logprobs_buffer = []
-                text = ""
-        if cancel_event.is_set() or model_kit.is_shutdown():
-            yield construct_user_cancelled_result()
+        finally:
+            # Callers that stop iterating before StopIteration would otherwise
+            # skip finalize_generation. It is a no-op if already called.
             cw = getattr(model_kit, "cache_wrapper", None)
             if cw is not None and not image_cache_prefill_done:
                 cw.finalize_generation()
-            return
-
-        cw = getattr(model_kit, "cache_wrapper", None)
-        if cw is not None and not image_cache_prefill_done:
-            cw.finalize_generation()
-        return
 
 
 def _batched_generation(

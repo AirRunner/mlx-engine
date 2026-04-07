@@ -1,6 +1,8 @@
+import bisect
 import copy
 import logging
 from collections import Counter
+from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -20,6 +22,18 @@ from mlx_engine.utils.prompt_progress_reporter import (
 
 
 PROMPT_PROCESSING_CHUNK_SIZE = 2048
+
+
+@dataclass
+class _PrefillCheckpoint:
+    """State captured at the LRU checkpoint boundary during update_cache.
+
+    Consumed by finalize_generation to restore the cache and insert into LRU.
+    """
+
+    gdn_snapshot: List  # deepcopy of ArraysCache layers at the checkpoint
+    lru_key: list       # think-normalized token key for LRU insertion
+    kv_len: int         # original-space token count at the checkpoint boundary
 
 
 def validate_prefill_step_size(prefill_step_size: Optional[int] = None) -> int:
@@ -88,8 +102,12 @@ class CacheWrapper:
         self.cache: List[Any] = make_prompt_cache(model, max_kv_size)
         self._lru: LRUPromptCache = LRUPromptCache(max_size=1)
         # Set by update_cache, consumed by finalize_generation.
-        self._gdn_snapshot: Optional[List] = None
-        self._lru_insert_key: Optional[list] = None
+        # Set by update_cache, consumed and cleared by finalize_generation.
+        self._prefill_checkpoint: Optional[_PrefillCheckpoint] = None
+        # Checkpoint from the last finalized turn, used as fallback when both
+        # LRU and disk miss: restore and prefill only the delta.
+        self._prev_gdn_snapshot: Optional[List] = None
+        self._prev_kv_len: Optional[int] = None
         self.model = model
         self.draft_model: Optional[nn.Module] = None
         self.max_kv_size = max_kv_size
@@ -172,8 +190,9 @@ class CacheWrapper:
         logger.info("Clearing current prompt cache and adding draft model to the cache")
         self.tokens = None
         self._lru = LRUPromptCache(max_size=1)
-        self._gdn_snapshot = None
-        self._lru_insert_key = None
+        self._prefill_checkpoint = None
+        self._prev_gdn_snapshot = None
+        self._prev_kv_len = None
         self.cache: List[Any] = make_prompt_cache(self.model)
         if draft_model is not None:
             self.cache += make_prompt_cache(draft_model)
@@ -186,17 +205,21 @@ class CacheWrapper:
         self.draft_model = None
         self.tokens = None
         self._lru = LRUPromptCache(max_size=1)
-        self._gdn_snapshot = None
-        self._lru_insert_key = None
+        self._prefill_checkpoint = None
+        self._prev_gdn_snapshot = None
+        self._prev_kv_len = None
         self.cache = self.cache[: len(self.model.layers)]
 
     def _checkpoint_offset(self, tokens: list) -> int:
         """Number of trailing tokens excluded from the LRU checkpoint key.
 
-        For thinking models the checkpoint ends just before the <think> token
-        so that the stored key matches the next turn's query even when clients
-        strip CoT blocks from conversation history.
-        Falls back to 1 for all other models.
+        For thinking models the key ends before the generation-prompt prefix
+        (role header + <think>) so that after think-block normalization the
+        stored key is a valid prefix of the next turn regardless of role.
+        The generation prompt occupies i + 3 tokens (think token at position
+        -i, plus the 3-token role header that precedes it in ChatML).
+
+        Falls back to 1 for non-thinking models.
         """
         if self._tokenizer is not None and getattr(
             self._tokenizer, "has_thinking", False
@@ -205,8 +228,76 @@ class CacheWrapper:
             if think_id is not None:
                 for i in range(1, min(11, len(tokens))):
                     if tokens[-i] == think_id:
-                        return i + 1
+                        return i + 3
         return 1
+
+    def _normalize_think_tokens(self, tokens: list) -> tuple:
+        """Strip complete <think>...</think> blocks for think-invariant LRU keys.
+
+        Clients often remove CoT blocks from conversation history. Normalizing
+        before key comparison ensures the LRU still hits after such stripping.
+        Incomplete trailing blocks are kept and handled by _checkpoint_offset.
+
+        Pure-whitespace tokens immediately after THINK_END are also stripped:
+        chat templates typically insert a separator between </think> and content,
+        and it must be removed so the normalized key matches the no-think
+        rendering. Whitespace membership is determined lazily via decode() and
+        cached in ``self._think_ws_cache``.
+
+        Returns (normalized_tokens, orig_indices) where orig_indices[i] is the
+        index of normalized_tokens[i] in the original list.
+        """
+        if self._tokenizer is None or not getattr(
+            self._tokenizer, "has_thinking", False
+        ):
+            return tokens, list(range(len(tokens)))
+        think_start = getattr(self._tokenizer, "think_start_id", None)
+        think_end = getattr(self._tokenizer, "think_end_id", None)
+        if think_start is None or think_end is None:
+            return tokens, list(range(len(tokens)))
+
+        # Lazy whitespace-token cache: maps token_id → bool (True = pure ws).
+        _ws = getattr(self, "_think_ws_cache", None)
+        if _ws is None:
+            _ws = {}
+            self._think_ws_cache = _ws
+        decode = getattr(self._tokenizer, "decode", None)
+
+        result: list = []
+        orig_indices: list = []
+        i = 0
+        while i < len(tokens):
+            if tokens[i] == think_start:
+                # Search for the matching end token.
+                j = i + 1
+                while j < len(tokens) and tokens[j] != think_end:
+                    j += 1
+                if j < len(tokens):
+                    # Complete block: skip i..j inclusive, then strip any
+                    # pure-whitespace separator tokens that immediately follow.
+                    next_i = j + 1
+                    while next_i < len(tokens):
+                        tid = tokens[next_i]
+                        if tid not in _ws:
+                            _ws[tid] = (
+                                decode is not None
+                                and not decode([tid]).strip()
+                            )
+                        if _ws[tid]:
+                            next_i += 1
+                        else:
+                            break
+                    i = next_i
+                else:
+                    # Trailing open block: keep as-is.
+                    result.append(tokens[i])
+                    orig_indices.append(i)
+                    i += 1
+            else:
+                result.append(tokens[i])
+                orig_indices.append(i)
+                i += 1
+        return result, orig_indices
 
     def update_cache(
         self,
@@ -216,13 +307,14 @@ class CacheWrapper:
         num_tokens_to_exclude: int = 1,
     ) -> mx.array:
         """
-        Set up the KV cache for the next generation.
-        Re-use as much of the KV cache from the previous generation as possible.
+        Set up the KV cache for the next generation, reusing as much of the
+        previous cache as possible.
 
-        The LRU key ends just before the <think> token for thinking models
-        so that it matches the next turn's query even when clients strip CoT
-        blocks from conversation history. The GDN snapshot is taken at the
-        same boundary so finalize_generation can restore to that state.
+        The LRU key is built from think-normalized tokens so that it matches
+        the next turn's query even when clients strip CoT blocks from history.
+        The key also ends just before any trailing open <think> token. The GDN
+        snapshot is taken at the same boundary so finalize_generation can
+        restore to that state.
 
         Args:
             prompt_tokens (mx.array): The prompt tokens.
@@ -239,19 +331,38 @@ class CacheWrapper:
         # If the generator from the previous turn was not exhausted by the caller
         # (early stop after receiving stop_condition), finalize_generation was never
         # called. Do it now before starting the new prefill.
-        if self._gdn_snapshot is not None:
+        if self._prefill_checkpoint is not None:
             self.finalize_generation()
 
         # 1. Fetch best matching prefix from LRU (returns a deepcopy).
-        # Take ownership immediately: evict the stored copy so generation
-        # runs with a single KV cache in VRAM (no 2x during generation).
-        cache, remaining = self._lru.fetch_nearest_cache("main", token_list)
+        # Keys are think-normalized so the LRU hits even when clients strip CoT blocks.
+        remaining = token_list  # overwritten on any cache hit
+        norm_tokens, norm_orig = self._normalize_think_tokens(token_list)
+        cache, remaining_norm = self._lru.fetch_nearest_cache("main", norm_tokens)
         if cache is not None:
-            self._lru = LRUPromptCache(max_size=1)  # free original, stay 1x
-            cached_by_lru = total_prompt_tokens - len(remaining)
+            self._lru = LRUPromptCache(max_size=1)  # evict; keep VRAM at 1x
+            cached_norm_count = len(norm_tokens) - len(remaining_norm)
+            # Map normalized boundary back to original-token position.
+            cached_by_lru = (
+                norm_orig[cached_norm_count]
+                if cached_norm_count < len(norm_orig)
+                else len(token_list)
+            )
+            remaining = token_list[cached_by_lru:]
             logger.info(f"[kv-lru] hit cached={cached_by_lru}/{total_prompt_tokens}")
 
-        # 2. No cache available: start from scratch.
+        # 2. Prev-checkpoint fallback: restore from the last finalized turn and
+        # re-prefill only the delta.  Evict the stale LRU entry to take ownership.
+        if cache is None and self._prev_kv_len is not None and self.cache is not None:
+            self._lru = LRUPromptCache(max_size=1)
+            cache = self.cache
+            remaining = token_list[self._prev_kv_len :]
+            logger.info(
+                f"[kv-prev] prev-checkpoint fallback"
+                f" at {self._prev_kv_len}/{total_prompt_tokens}"
+            )
+
+        # 3. No cache available: start from scratch.
         if cache is None:
             cache = make_prompt_cache(self.model, self.max_kv_size)
             remaining = token_list
@@ -308,10 +419,20 @@ class CacheWrapper:
             # GDN snapshot at checkpoint boundary (before <think>).
             # KV layers are trimmed back to this point in finalize_generation();
             # ArraysCache (GDN) layers are restored from this snapshot in-place.
-            self._gdn_snapshot = [
+            gdn_snapshot = [
                 copy.deepcopy(c) if isinstance(c, ArraysCache) else None for c in cache
             ]
-            self._lru_insert_key = token_list[:effective_checkpoint]
+            # LRU key in normalized space; bisect maps the checkpoint boundary.
+            if len(norm_tokens) < len(token_list):
+                norm_cp = bisect.bisect_left(norm_orig, effective_checkpoint)
+                lru_key = norm_tokens[:norm_cp]
+            else:
+                lru_key = token_list[:effective_checkpoint]
+            self._prefill_checkpoint = _PrefillCheckpoint(
+                gdn_snapshot=gdn_snapshot,
+                lru_key=lru_key,
+                kv_len=effective_checkpoint,
+            )
 
             # Phase 2: prefill from checkpoint to end (the <think>\n tokens).
             if phase2.size > 0:
@@ -346,8 +467,7 @@ class CacheWrapper:
             else:
                 c.trim(n_to_trim)
         self._lru.insert_cache("main", lru_key, self.cache)
-        self._gdn_snapshot = None
-        self._lru_insert_key = None
+        self._prefill_checkpoint = None
 
     def finalize_generation(self) -> None:
         """Restore cache to post-prefill state and insert into LRU.
@@ -357,22 +477,18 @@ class CacheWrapper:
         snapshot taken in update_cache. The resulting clean cache is stored in the
         LRU for next-turn prefix reuse.
         """
-        if (
-            self._gdn_snapshot is None
-            or self._lru_insert_key is None
-            or self.tokens is None
-        ):
+        if self._prefill_checkpoint is None or self.tokens is None:
             return
-        # n_to_trim = (prompt + generated tokens) - key length = generated + 1
-        # (the +1 comes from the excluded token returned to the generator).
-        n_to_trim = len(self.tokens) - len(self._lru_insert_key)
-        lru_key = self._lru_insert_key
-        lru_key_len = len(lru_key)
-        self._restore_and_insert(self._gdn_snapshot, lru_key, n_to_trim)
+        cp = self._prefill_checkpoint
+        n_to_trim = len(self.tokens) - cp.kv_len
+        # Preserve prev-checkpoint before _restore_and_insert clears it.
+        self._prev_gdn_snapshot = cp.gdn_snapshot
+        self._prev_kv_len = cp.kv_len
+        self._restore_and_insert(cp.gdn_snapshot, cp.lru_key, n_to_trim)
         kv_offset = next((c.offset for c in self.cache if isinstance(c, KVCache)), -1)
         lru_size_after = len(self._lru)
         logger.info(
-            f"[kv] finalize done key_len={lru_key_len} kv_offset={kv_offset}"
+            f"[kv] finalize done key_len={len(cp.lru_key)} kv_offset={kv_offset}"
             f" lru_size={lru_size_after} {_vram_str(self.cache)}"
         )
 
