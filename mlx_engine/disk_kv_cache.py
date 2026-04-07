@@ -1,8 +1,10 @@
 import hashlib
 import json
 import logging
+import os
 import time
 from pathlib import Path
+from typing import Optional
 
 import mlx_lm
 from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
@@ -11,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path.home() / ".cache" / "mlx-engine" / "kv_cache"
 MIN_TOKENS = 1000
-MAX_CACHE_BYTES = 2 * 1024**3  # 2 GB
+_MAX_CACHE_BYTES = int(os.environ.get("MLX_DISK_KV_CACHE_MAX_GB", "2")) * 1024**3
 
 
 def _sha256_tokens(tokens: list) -> str:
@@ -31,10 +33,11 @@ class DiskKVCacheStore:
     Each entry in the manifest stores the full token list so that prefix
     matching can be performed without loading the arrays.
 
-    Disk LRU eviction: total cache size is capped at MAX_CACHE_BYTES (default
-    2 GB).  Each entry tracks ``last_used`` (updated on every hit) and
-    ``file_size``.  When a new save would exceed the cap, the least-recently-
-    used entries are deleted first.
+    Disk eviction: total size is capped at ``_MAX_CACHE_BYTES`` (default 2 GB,
+    configurable via ``MLX_DISK_KV_CACHE_MAX_GB``).  Each entry tracks
+    ``last_used`` and ``file_size``.  Near-duplicate entries (same plugin,
+    token count within 1%, group ≥ 2) are evicted first; global LRU is the
+    fallback.
     """
 
     def __init__(self) -> None:
@@ -52,7 +55,13 @@ class DiskKVCacheStore:
     # Public API
     # ------------------------------------------------------------------
 
-    def maybe_save(self, tokens: list, model_path: str, cache: list) -> None:
+    def maybe_save(
+        self,
+        tokens: list,
+        model_path: str,
+        cache: list,
+        plugin_name: Optional[str] = None,
+    ) -> None:
         """Persist *cache* to disk keyed by *tokens*, if above MIN_TOKENS.
 
         No-op if an entry for (sha256, model_path) already exists.
@@ -92,6 +101,7 @@ class DiskKVCacheStore:
             "token_count": len(tokens),
             "file_size": cache_file.stat().st_size,
             "last_used": time.time(),
+            "plugin_name": plugin_name,
         }
         self._evict_if_needed()
         self._save_manifest()
@@ -144,26 +154,60 @@ class DiskKVCacheStore:
     # ------------------------------------------------------------------
 
     def _evict_if_needed(self) -> None:
-        """Delete least-recently-used entries until total size is below MAX_CACHE_BYTES."""
-        total = sum(e.get("file_size", 0) for e in self._manifest.values())
-        if total <= MAX_CACHE_BYTES:
-            return
+        """Evict entries until total size is below _MAX_CACHE_BYTES.
 
-        # Sort by last_used ascending (oldest first); entries without last_used evicted first.
-        by_age = sorted(
-            self._manifest.items(), key=lambda kv: kv[1].get("last_used", 0)
+        Near-duplicate entries (same plugin_name, token_count within 1%) are
+        evicted first when they form a group of ≥ 2, preventing one client
+        from crowding out caches from other clients. Falls back to global LRU.
+        """
+        total = sum(e.get("file_size", 0) for e in self._manifest.values())
+        while total > _MAX_CACHE_BYTES:
+            sha = self._find_near_duplicate_to_evict()
+            reason = "near-dup" if sha is not None else "LRU"
+            if sha is None:
+                sha = min(
+                    self._manifest, key=lambda s: self._manifest[s].get("last_used", 0)
+                )
+            total -= self._evict_one(sha, reason)
+
+    def _find_near_duplicate_to_evict(self) -> Optional[str]:
+        """Return the oldest entry in a near-duplicate group (≥ 2 members).
+
+        A near-duplicate group shares the same plugin_name and has token_count
+        values within 1% of each other.  Only groups with ≥ 2 existing members
+        are considered, so unique entries are never preferentially evicted.
+        """
+        entries = list(self._manifest.items())
+        near_dup_shas: set = set()
+        for i, (sha_a, entry_a) in enumerate(entries):
+            plugin_a = entry_a.get("plugin_name")
+            count_a = entry_a.get("token_count", 0)
+            if count_a == 0:
+                continue
+            for sha_b, entry_b in entries[i + 1 :]:
+                if entry_b.get("plugin_name") != plugin_a:
+                    continue
+                count_b = entry_b.get("token_count", 0)
+                if abs(count_a - count_b) / count_a <= 0.01:
+                    near_dup_shas.add(sha_a)
+                    near_dup_shas.add(sha_b)
+        if not near_dup_shas:
+            return None
+        return min(near_dup_shas, key=lambda s: self._manifest[s].get("last_used", 0))
+
+    def _evict_one(self, sha: str, reason: str) -> int:
+        """Delete one manifest entry and its safetensors file; return freed bytes."""
+        entry = self._manifest.pop(sha)
+        cache_file = CACHE_DIR / f"{sha}.safetensors"
+        try:
+            cache_file.unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"[kv-disk] evict unlink failed {sha[:8]}: {e}")
+        size = entry.get("file_size", 0)
+        logger.info(
+            f"[kv-disk] evicted {sha[:8]} ({reason}, freed {size // 1024**2} MB)"
         )
-        for sha, entry in by_age:
-            if total <= MAX_CACHE_BYTES:
-                break
-            cache_file = CACHE_DIR / f"{sha}.safetensors"
-            try:
-                cache_file.unlink(missing_ok=True)
-            except Exception as e:
-                logger.warning(f"[kv-disk] evict unlink failed {sha[:8]}: {e}")
-            total -= entry.get("file_size", 0)
-            del self._manifest[sha]
-            logger.info(f"[kv-disk] evicted {sha[:8]} (LRU, freed {entry.get('file_size', 0) // 1024**2} MB)")
+        return size
 
     def _save_manifest(self) -> None:
         try:
