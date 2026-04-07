@@ -32,8 +32,8 @@ class _PrefillCheckpoint:
     """
 
     gdn_snapshot: List  # deepcopy of ArraysCache layers at the checkpoint
-    lru_key: list       # think-normalized token key for LRU insertion
-    kv_len: int         # original-space token count at the checkpoint boundary
+    lru_key: list  # think-normalized token key for LRU insertion
+    kv_len: int  # original-space token count at the checkpoint boundary
 
 
 def validate_prefill_step_size(prefill_step_size: Optional[int] = None) -> int:
@@ -71,7 +71,6 @@ def _vram_str(kv_cache: list | None = None) -> str:
         kv_mb = sum(getattr(c, "nbytes", 0) for c in kv_cache) // 1024**2
         return f"VRAM {total} MB (active={active} cache={alloc_cache} kv={kv_mb})"
     return f"VRAM {total} MB (active={active} cache={alloc_cache})"
-
 
 
 class CacheWrapper:
@@ -214,10 +213,12 @@ class CacheWrapper:
         """Number of trailing tokens excluded from the LRU checkpoint key.
 
         For thinking models the key ends before the generation-prompt prefix
-        (role header + <think>) so that after think-block normalization the
-        stored key is a valid prefix of the next turn regardless of role.
-        The generation prompt occupies i + 3 tokens (think token at position
-        -i, plus the 3-token role header that precedes it in ChatML).
+        (role header + <think>) so that the stored key is a valid prefix of
+        the next turn's prompt regardless of role.
+
+        The number of tokens between the role header and <think> (inclusive)
+        is read from ``tokenizer.thinking_prefix_offset`` (default 3 for
+        ChatML-based templates).
 
         Falls back to 1 for non-thinking models.
         """
@@ -226,12 +227,13 @@ class CacheWrapper:
         ):
             think_id = getattr(self._tokenizer, "think_start_id", None)
             if think_id is not None:
+                prefix_len = getattr(self._tokenizer, "thinking_prefix_offset", 3)
                 for i in range(1, min(11, len(tokens))):
                     if tokens[-i] == think_id:
-                        return i + 3
+                        return i + prefix_len
         return 1
 
-    def _normalize_think_tokens(self, tokens: list) -> tuple:
+    def _normalize_think_tokens(self, tokens: list) -> tuple[list, list[int]]:
         """Strip complete <think>...</think> blocks for think-invariant LRU keys.
 
         Clients often remove CoT blocks from conversation history. Normalizing
@@ -279,10 +281,7 @@ class CacheWrapper:
                     while next_i < len(tokens):
                         tid = tokens[next_i]
                         if tid not in _ws:
-                            _ws[tid] = (
-                                decode is not None
-                                and not decode([tid]).strip()
-                            )
+                            _ws[tid] = decode is not None and not decode([tid]).strip()
                         if _ws[tid]:
                             next_i += 1
                         else:
@@ -389,7 +388,6 @@ class CacheWrapper:
         effective_checkpoint = max(checkpoint_idx, cached_tokens)
         # Position within prefill_tokens (0-based relative to cached_tokens).
         checkpoint_end = min(effective_checkpoint - cached_tokens, len(prefill_tokens))
-
 
         with mx.stream(generation_stream):
             if self.draft_model is not None:

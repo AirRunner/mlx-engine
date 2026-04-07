@@ -15,7 +15,7 @@ THINK_START = 1000
 THINK_END = 1001
 
 
-SEP = 9999   # Fake post-think separator — decodes to "\n\n" (whitespace).
+SEP = 9999  # Fake post-think separator — decodes to "\n\n" (whitespace).
 SEP2 = 8888  # Second fake separator — decodes to "\n" (whitespace).
 
 
@@ -45,7 +45,6 @@ def _normalize(tokenizer, tokens: list) -> tuple:
 
 
 class TestNormalizeThinkTokens(unittest.TestCase):
-
     # ------------------------------------------------------------------
     # No-op cases
     # ------------------------------------------------------------------
@@ -106,10 +105,14 @@ class TestNormalizeThinkTokens(unittest.TestCase):
         """Multiple complete blocks are all stripped, interleaved content preserved."""
         tok = _make_tokenizer()
         tokens = [
-            THINK_START, 10, THINK_END,   # block 1
-            5,                             # content
-            THINK_START, 20, THINK_END,   # block 2
-            6,                             # content
+            THINK_START,
+            10,
+            THINK_END,  # block 1
+            5,  # content
+            THINK_START,
+            20,
+            THINK_END,  # block 2
+            6,  # content
         ]
         norm, orig = _normalize(tok, tokens)
         self.assertEqual(norm, [5, 6])
@@ -147,9 +150,12 @@ class TestNormalizeThinkTokens(unittest.TestCase):
         """Complete block stripped, trailing open block kept."""
         tok = _make_tokenizer()
         tokens = [
-            THINK_START, 10, THINK_END,   # complete block
-            5,                             # content
-            THINK_START, 20,              # trailing open block (no end)
+            THINK_START,
+            10,
+            THINK_END,  # complete block
+            5,  # content
+            THINK_START,
+            20,  # trailing open block (no end)
         ]
         norm, orig = _normalize(tok, tokens)
         # Complete block stripped; trailing open block and its content kept
@@ -164,9 +170,17 @@ class TestNormalizeThinkTokens(unittest.TestCase):
         """orig_indices must always be strictly monotonically increasing."""
         tok = _make_tokenizer()
         tokens = [
-            1, THINK_START, 10, 11, THINK_END, 2,
-            THINK_START, 20, THINK_END,
-            3, 4,
+            1,
+            THINK_START,
+            10,
+            11,
+            THINK_END,
+            2,
+            THINK_START,
+            20,
+            THINK_END,
+            3,
+            4,
         ]
         _, orig = _normalize(tok, tokens)
         self.assertEqual(orig, sorted(set(orig)))  # strictly increasing
@@ -213,9 +227,15 @@ class TestNormalizeThinkTokensSep(unittest.TestCase):
         tok = _make_tokenizer()
         tokens = [
             1,
-            THINK_START, 10, THINK_END, SEP,  # block 1 + sep
+            THINK_START,
+            10,
+            THINK_END,
+            SEP,  # block 1 + sep
             2,
-            THINK_START, 20, THINK_END, SEP,  # block 2 + sep
+            THINK_START,
+            20,
+            THINK_END,
+            SEP,  # block 2 + sep
             3,
         ]
         norm, orig = _normalize(tok, tokens)
@@ -309,8 +329,16 @@ class TestNormalizeThinkTokensSep(unittest.TestCase):
         """orig_indices are strictly increasing with sep stripping."""
         tok = _make_tokenizer()
         tokens = [
-            1, THINK_START, 10, THINK_END, SEP,
-            2, THINK_START, 20, THINK_END, SEP,
+            1,
+            THINK_START,
+            10,
+            THINK_END,
+            SEP,
+            2,
+            THINK_START,
+            20,
+            THINK_END,
+            SEP,
             3,
         ]
         _, orig = _normalize(tok, tokens)

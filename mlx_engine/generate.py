@@ -986,7 +986,9 @@ def _sequential_generation(
                     continue
 
                 # Standard yield - yield when a non-empty text segment is available or eos token is hit
-                should_yield, stop_condition = should_yield_token(text, token, tokenizer)
+                should_yield, stop_condition = should_yield_token(
+                    text, token, tokenizer
+                )
                 if should_yield:
                     yield GenerationResult(
                         text=text,
