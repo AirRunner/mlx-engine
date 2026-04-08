@@ -1,4 +1,3 @@
-import copy
 import hashlib
 from contextlib import contextmanager
 import mlx.core as mx
@@ -520,8 +519,7 @@ def _prefill_modelkit_with_image_checkpoints(
 
     Returns:
         (cache, block_checkpoints) where block_checkpoints is a list of
-        (image_end_index, cache_snapshot) pairs with absolute indices, one per
-        image block in input_ids.
+        image_end_index values (int) with absolute indices, one per image block.
     """
     total = input_ids.shape[0]
     prefill_len = total - 1  # stream_generate handles the last token
@@ -565,7 +563,7 @@ def _prefill_modelkit_with_image_checkpoints(
         processed += end - i
 
         if end in snap_set:
-            block_checkpoints.append((end + base_offset, copy.deepcopy(cache)))
+            block_checkpoints.append(end + base_offset)
 
         if not reporter.update(is_draft=False, prefill_tokens_processed=processed):
             raise StopPromptProcessing
@@ -642,20 +640,26 @@ def _process_modelkit_image_cache(
 
     # --- Full hit path ---
     if is_full_hit:
-        _, cache_snapshot, image_end_index = hit
+        _, image_end_index = hit
 
         # Try LRU/prev-checkpoint first: if it covers at least image_end_index
-        # tokens we can skip the image snapshot deepcopy entirely.
+        # tokens we can start prefill from there without any deepcopy.
         lru_cache, lru_start = (
             cw._find_starting_cache(input_ids_list, prefer_prev_checkpoint=True)
-            if cw else (None, 0)
+            if cw
+            else (None, 0)
         )
         if lru_cache is not None and lru_start >= image_end_index:
             cache = lru_cache
             start_idx = lru_start
         else:
-            cache = copy.deepcopy(cache_snapshot)
-            start_idx = image_end_index
+            # Impossible in practice: prev-checkpoint is always available and
+            # covers image_end_index after any completed image turn.
+            logger.warning(
+                "[kv-image] full hit: no LRU available, rebuilding from scratch"
+            )
+            cache = make_prompt_cache(model_kit.model)
+            start_idx = 0
 
         # Restore full MRoPE state so suffix tokens use the original stored positions.
         # rope_deltas was already set by _prepare_inputs; position_ids completes it.
@@ -683,7 +687,7 @@ def _process_modelkit_image_cache(
     # --- Partial hit path ---
     is_partial_hit = hit is not None
     if is_partial_hit:
-        hit_key, hit_cache_snapshot, hit_image_end_index = hit
+        hit_key, hit_image_end_index = hit
         partial_depth = len(hit_key)
 
         # Compute pixel patch boundaries per image to slice pixel_values.
@@ -723,16 +727,22 @@ def _process_modelkit_image_cache(
             model_kit.model.language_model.model.position_ids = position_ids
 
         # Try LRU/prev-checkpoint: if it covers past hit_image_end_index we can
-        # skip the image snapshot deepcopy and shorten the prefill.
+        # skip any deepcopy and shorten the prefill.
         lru_cache, lru_start = (
             cw._find_starting_cache(input_ids_list, prefer_prev_checkpoint=True)
-            if cw else (None, 0)
+            if cw
+            else (None, 0)
         )
         if lru_cache is not None and lru_start >= hit_image_end_index:
             cache = lru_cache
             actual_start = lru_start
         else:
-            cache = copy.deepcopy(hit_cache_snapshot)
+            # Impossible in practice: prev-checkpoint is always available and
+            # covers hit_image_end_index after any completed image turn.
+            logger.warning(
+                "[kv-image] partial hit: no LRU available, rebuilding from scratch"
+            )
+            cache = make_prompt_cache(model_kit.model)
             actual_start = hit_image_end_index
 
         # Boundaries relative to suffix_input_ids, then adjusted for actual_start.

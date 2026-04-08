@@ -313,7 +313,11 @@ class CacheWrapper:
                                     Use this in the image path to avoid the deepcopy
                                     that fetch_nearest_cache performs.
         """
-        if prefer_prev_checkpoint and self._prev_kv_len is not None and self.cache is not None:
+        if (
+            prefer_prev_checkpoint
+            and self._prev_kv_len is not None
+            and self.cache is not None
+        ):
             self._lru = LRUPromptCache(max_size=1)
             return self.cache, self._prev_kv_len
 
@@ -593,18 +597,19 @@ class ImageCheckpointStore:
     def save_image_checkpoint(
         self,
         key: tuple,
-        cache_snapshot,
         image_end_index: int,
         prefix_hash: int,
         block_lengths: tuple = (),
     ) -> None:
         """
-        Persist a KV snapshot taken right after an image block.
+        Persist image checkpoint metadata right after an image block.
+
+        No KV tensors are stored: the text LRU (via CacheWrapper) is used at
+        restore time, which keeps VRAM at 1x KV instead of 2x.
 
         Args:
             key:             Tuple of per-image SHA-256 hex digests up to and
                              including this block, e.g. (hash1,) or (hash1, hash2).
-            cache_snapshot:  Deep-copied KV cache list.
             image_end_index: First text-token index after this image block.
             prefix_hash:     Python hash of the VLM token ids up to image_end_index
                              at save time. Used to detect stale checkpoints from a
@@ -617,7 +622,6 @@ class ImageCheckpointStore:
                              checkpoint must be invalidated before computing hashes.
         """
         self._image_checkpoints[key] = (
-            cache_snapshot,
             image_end_index,
             prefix_hash,
             block_lengths,
@@ -628,8 +632,7 @@ class ImageCheckpointStore:
 
     def get_image_checkpoint(self, key: tuple):
         """
-        Return ``(cache_snapshot, image_end_index, prefix_hash, block_lengths)``
-        for *key*, or None.
+        Return ``(image_end_index, prefix_hash, block_lengths)`` for *key*, or None.
         """
         return self._image_checkpoints.get(key)
 
@@ -668,7 +671,7 @@ class ImageCheckpointStore:
         if entry is None:
             return False
 
-        _, stored_end_idx, stored_prefix_hash, stored_block_lengths = entry
+        stored_end_idx, stored_prefix_hash, stored_block_lengths = entry
         depth = len(check_key)
 
         # 1. Block-length gap check.
@@ -745,7 +748,7 @@ class ImageCheckpointStore:
         input_ids_flat: list,
         block_lengths: tuple,
     ) -> None:
-        """Compute per-block prefix hashes and persist KV checkpoints.
+        """Compute per-block prefix hashes and persist image checkpoint metadata.
 
         Abstracts the hash computation and key construction so callers do not
         need to repeat this logic for both the full-miss and partial-hit paths.
@@ -756,18 +759,17 @@ class ImageCheckpointStore:
                                a full miss; ``partial_depth`` for a partial hit.
                                Checkpoint at index ``i`` is stored under
                                ``hash_chain[:offset + i + 1]``.
-            block_checkpoints: List of ``(image_end_index, cache_snapshot)``
-                               pairs, one per newly processed image block.
+            block_checkpoints: List of ``image_end_index`` values (int), one per
+                               newly processed image block.
             input_ids_flat:    Full VLM token sequence as a flat list.
                                Used to compute prefix hashes at each boundary.
             block_lengths:     Image block token counts for the full turn, used
                                as a structural staleness check on the next turn.
         """
-        for i, (end_idx, snap) in enumerate(block_checkpoints):
+        for i, end_idx in enumerate(block_checkpoints):
             pfx_hash = hash(tuple(input_ids_flat[:end_idx]))
             self.save_image_checkpoint(
                 hash_chain[: offset + i + 1],
-                snap,
                 end_idx,
                 pfx_hash,
                 block_lengths[: offset + i + 1],
@@ -786,14 +788,14 @@ class ImageCheckpointStore:
 
     def find_deepest_image_checkpoint(self, hash_chain: tuple):
         """
-        Return (key, cache_snapshot, image_end_index) for the longest prefix of
-        *hash_chain* that has a stored checkpoint, or None if no prefix matches.
+        Return (key, image_end_index) for the longest prefix of *hash_chain*
+        that has a stored checkpoint, or None if no prefix matches.
         """
         for depth in range(len(hash_chain), 0, -1):
             key = hash_chain[:depth]
             entry = self._image_checkpoints.get(key)
             if entry is not None:
-                return key, entry[0], entry[1]
+                return key, entry[0]
         return None
 
     # TODO: remove once lmstudio-ai/lmstudio-bug-tracker#1663 is fixed upstream.
