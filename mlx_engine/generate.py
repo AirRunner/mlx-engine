@@ -739,11 +739,12 @@ def _process_modelkit_image_cache(
         else:
             # Impossible in practice: prev-checkpoint is always available and
             # covers hit_image_end_index after any completed image turn.
+            # Rebuild from scratch and skip the partial hit optimisation entirely.
             logger.warning(
                 "[kv-image] partial hit: no LRU available, rebuilding from scratch"
             )
-            cache = make_prompt_cache(model_kit.model)
-            actual_start = hit_image_end_index
+            generate_args["prompt_cache"] = make_prompt_cache(model_kit.model)
+            return
 
         # Boundaries relative to suffix_input_ids, then adjusted for actual_start.
         all_boundaries = image_block_boundaries(input_ids_list, img_tok, vid_tok)
