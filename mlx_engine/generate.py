@@ -601,6 +601,17 @@ def _process_modelkit_image_cache(
     vision_add_on.clear_prediction_state(model_kit.model)
     model_kit._cross_prompt_cache_active = False
 
+    cw = getattr(model_kit, "cache_wrapper", None)
+
+    def _activate_lru(cache, token_list, start_idx, input_ids) -> None:
+        """Register the post-prefill cache with CacheWrapper and enable LRU recording."""
+        if cw is None:
+            return
+        cw.set_image_turn_checkpoint(cache, token_list, start_idx)
+        cw.tokens = input_ids
+        cw.cache = cache
+        model_kit._cross_prompt_cache_active = True
+
     # Reorder images to chronological conversation order.
     image_hashes = list(_hash_images(images_b64))
     images_b64, image_hashes = image_store.reorder_images_chronologically(
@@ -632,7 +643,19 @@ def _process_modelkit_image_cache(
     # --- Full hit path ---
     if is_full_hit:
         _, cache_snapshot, image_end_index = hit
-        cache = copy.deepcopy(cache_snapshot)
+
+        # Try LRU/prev-checkpoint first: if it covers at least image_end_index
+        # tokens we can skip the image snapshot deepcopy entirely.
+        lru_cache, lru_start = (
+            cw._find_starting_cache(input_ids_list, prefer_prev_checkpoint=True)
+            if cw else (None, 0)
+        )
+        if lru_cache is not None and lru_start >= image_end_index:
+            cache = lru_cache
+            start_idx = lru_start
+        else:
+            cache = copy.deepcopy(cache_snapshot)
+            start_idx = image_end_index
 
         # Restore full MRoPE state so suffix tokens use the original stored positions.
         # rope_deltas was already set by _prepare_inputs; position_ids completes it.
@@ -641,18 +664,19 @@ def _process_modelkit_image_cache(
 
         cache, _ = _prefill_modelkit_with_image_checkpoints(
             model_kit,
-            input_ids[image_end_index:],
+            input_ids[start_idx:],
             None,
             [],
             reporter,
             initial_cache=cache,
-            cached_tokens=image_end_index,
+            cached_tokens=start_idx,
         )
 
+        _activate_lru(cache, input_ids_list, start_idx, input_ids)
         generate_args["prompt_cache"] = cache
         logger.info(
             f"[kv-image] cache hit depth={len(hash_chain)}"
-            f" cached={image_end_index}/{len(input_ids_list)} tokens"
+            f" cached={start_idx}/{len(input_ids_list)} tokens"
         )
         return input_ids[-1:], None
 
@@ -694,37 +718,56 @@ def _process_modelkit_image_cache(
         )
         final_embeds = final_embeds.squeeze(0)
 
-        # Restore MRoPE state and checkpoint.
+        # Restore MRoPE state.
         if position_ids is not None:
             model_kit.model.language_model.model.position_ids = position_ids
-        cache = copy.deepcopy(hit_cache_snapshot)
 
-        # Boundaries relative to suffix_input_ids.
+        # Try LRU/prev-checkpoint: if it covers past hit_image_end_index we can
+        # skip the image snapshot deepcopy and shorten the prefill.
+        lru_cache, lru_start = (
+            cw._find_starting_cache(input_ids_list, prefer_prev_checkpoint=True)
+            if cw else (None, 0)
+        )
+        if lru_cache is not None and lru_start >= hit_image_end_index:
+            cache = lru_cache
+            actual_start = lru_start
+        else:
+            cache = copy.deepcopy(hit_cache_snapshot)
+            actual_start = hit_image_end_index
+
+        # Boundaries relative to suffix_input_ids, then adjusted for actual_start.
         all_boundaries = image_block_boundaries(input_ids_list, img_tok, vid_tok)
         suffix_boundaries = [
             (s - hit_image_end_index, e - hit_image_end_index)
             for s, e in all_boundaries
             if e > hit_image_end_index
         ]
+        embed_slice = actual_start - hit_image_end_index
+        adjusted_boundaries = [
+            (s - embed_slice, e - embed_slice)
+            for s, e in suffix_boundaries
+            if e > embed_slice
+        ]
 
         cache, new_checkpoints = _prefill_modelkit_with_image_checkpoints(
             model_kit,
-            suffix_input_ids,
-            final_embeds,
-            suffix_boundaries,
+            suffix_input_ids[embed_slice:],
+            final_embeds[embed_slice:],
+            adjusted_boundaries,
             reporter,
             initial_cache=cache,
-            cached_tokens=hit_image_end_index,
-            base_offset=hit_image_end_index,
+            cached_tokens=actual_start,
+            base_offset=actual_start,
         )
         image_store.save_block_checkpoints(
             hash_chain, partial_depth, new_checkpoints, input_ids_list, block_lengths
         )
 
+        _activate_lru(cache, input_ids_list, actual_start, input_ids)
         generate_args["prompt_cache"] = cache
         logger.info(
             f"[kv-image] partial hit depth={partial_depth}/{len(hash_chain)}"
-            f" cached={hit_image_end_index}/{len(input_ids_list)} tokens"
+            f" cached={actual_start}/{len(input_ids_list)} tokens"
         )
         return input_ids[-1:], final_embeds[-1:]
 
@@ -768,6 +811,8 @@ def _process_modelkit_image_cache(
         hash_chain, 0, block_checkpoints, ids_list, block_lengths
     )
 
+    start_idx = pre_cached if pre_cache is not None else 0
+    _activate_lru(cache, ids_list, start_idx, input_ids)
     generate_args["prompt_cache"] = cache
     return input_ids[-1:], embeddings[-1:]
 
@@ -1004,9 +1049,9 @@ def _sequential_generation(
                 return
         finally:
             # Callers that stop iterating before StopIteration would otherwise
-            # skip finalize_generation. It is a no-op if already called.
+            # skip finalize_generation. It is a no-op if _prefill_checkpoint is None.
             cw = getattr(model_kit, "cache_wrapper", None)
-            if cw is not None and not image_cache_prefill_done:
+            if cw is not None:
                 cw.finalize_generation()
 
 

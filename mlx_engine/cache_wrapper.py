@@ -298,6 +298,74 @@ class CacheWrapper:
                 i += 1
         return result, orig_indices
 
+    def _find_starting_cache(
+        self, token_list: list, *, prefer_prev_checkpoint: bool = False
+    ) -> tuple[Any, int]:
+        """Return (cache, start_idx) for the best available prefix of token_list.
+
+        Checks, in order: prev-checkpoint (if preferred), LRU, prev-checkpoint
+        (fallback). Evicts the LRU when a cache is returned so VRAM stays at 1x.
+        Returns (None, 0) when no cached prefix is available.
+
+        Args:
+            token_list:             Full prompt as a flat Python list.
+            prefer_prev_checkpoint: When True, try prev-checkpoint before the LRU.
+                                    Use this in the image path to avoid the deepcopy
+                                    that fetch_nearest_cache performs.
+        """
+        if prefer_prev_checkpoint and self._prev_kv_len is not None and self.cache is not None:
+            self._lru = LRUPromptCache(max_size=1)
+            return self.cache, self._prev_kv_len
+
+        norm_tokens, norm_orig = self._normalize_think_tokens(token_list)
+        cache, remaining_norm = self._lru.fetch_nearest_cache("main", norm_tokens)
+        if cache is not None:
+            self._lru = LRUPromptCache(max_size=1)
+            cached_norm = len(norm_tokens) - len(remaining_norm)
+            start = (
+                norm_orig[cached_norm]
+                if cached_norm < len(norm_orig)
+                else len(token_list)
+            )
+            return cache, start
+
+        if self._prev_kv_len is not None and self.cache is not None:
+            self._lru = LRUPromptCache(max_size=1)
+            return self.cache, self._prev_kv_len
+
+        return None, 0
+
+    def set_image_turn_checkpoint(
+        self, cache: list, token_list: list, cached_tokens: int
+    ) -> None:
+        """Set _prefill_checkpoint after an image-path prefill.
+
+        Mirrors the checkpoint logic in update_cache so that finalize_generation
+        can trim KV layers, restore GDN layers, and insert into the LRU after an
+        image-turn generation completes.
+
+        Args:
+            cache:         The live KV cache after the image prefill.
+            token_list:    Full VLM-expanded prompt as a flat Python list.
+            cached_tokens: Number of tokens already in cache before the image
+                           prefill started (used as a lower bound for kv_len).
+        """
+        checkpoint_offset = self._checkpoint_offset(token_list)
+        checkpoint_idx = len(token_list) - checkpoint_offset
+        effective_checkpoint = max(checkpoint_idx, cached_tokens)
+        norm_tokens, norm_orig = self._normalize_think_tokens(token_list)
+        if len(norm_tokens) < len(token_list):
+            norm_cp = bisect.bisect_left(norm_orig, effective_checkpoint)
+            lru_key = norm_tokens[:norm_cp]
+        else:
+            lru_key = token_list[:effective_checkpoint]
+        gdn_snapshot = [
+            copy.deepcopy(c) if isinstance(c, ArraysCache) else None for c in cache
+        ]
+        self._prefill_checkpoint = _PrefillCheckpoint(
+            gdn_snapshot=gdn_snapshot, lru_key=lru_key, kv_len=effective_checkpoint
+        )
+
     def update_cache(
         self,
         prompt_tokens: mx.array,
@@ -333,36 +401,11 @@ class CacheWrapper:
         if self._prefill_checkpoint is not None:
             self.finalize_generation()
 
-        # 1. Fetch best matching prefix from LRU (returns a deepcopy).
-        # Keys are think-normalized so the LRU hits even when clients strip CoT blocks.
-        remaining = token_list  # overwritten on any cache hit
-        norm_tokens, norm_orig = self._normalize_think_tokens(token_list)
-        cache, remaining_norm = self._lru.fetch_nearest_cache("main", norm_tokens)
+        cache, cached_by = self._find_starting_cache(token_list)
         if cache is not None:
-            self._lru = LRUPromptCache(max_size=1)  # evict; keep VRAM at 1x
-            cached_norm_count = len(norm_tokens) - len(remaining_norm)
-            # Map normalized boundary back to original-token position.
-            cached_by_lru = (
-                norm_orig[cached_norm_count]
-                if cached_norm_count < len(norm_orig)
-                else len(token_list)
-            )
-            remaining = token_list[cached_by_lru:]
-            logger.info(f"[kv-lru] hit cached={cached_by_lru}/{total_prompt_tokens}")
-
-        # 2. Prev-checkpoint fallback: restore from the last finalized turn and
-        # re-prefill only the delta.  Evict the stale LRU entry to take ownership.
-        if cache is None and self._prev_kv_len is not None and self.cache is not None:
-            self._lru = LRUPromptCache(max_size=1)
-            cache = self.cache
-            remaining = token_list[self._prev_kv_len :]
-            logger.info(
-                f"[kv-prev] prev-checkpoint fallback"
-                f" at {self._prev_kv_len}/{total_prompt_tokens}"
-            )
-
-        # 3. No cache available: start from scratch.
-        if cache is None:
+            remaining = token_list[cached_by:]
+            logger.info(f"[kv] cache hit cached={cached_by}/{total_prompt_tokens}")
+        else:
             cache = make_prompt_cache(self.model, self.max_kv_size)
             remaining = token_list
 
@@ -421,6 +464,7 @@ class CacheWrapper:
                 copy.deepcopy(c) if isinstance(c, ArraysCache) else None for c in cache
             ]
             # LRU key in normalized space; bisect maps the checkpoint boundary.
+            norm_tokens, norm_orig = self._normalize_think_tokens(token_list)
             if len(norm_tokens) < len(token_list):
                 norm_cp = bisect.bisect_left(norm_orig, effective_checkpoint)
                 lru_key = norm_tokens[:norm_cp]
