@@ -107,6 +107,7 @@ class CacheWrapper:
         # LRU and disk miss: restore and prefill only the delta.
         self._prev_gdn_snapshot: Optional[List] = None
         self._prev_kv_len: Optional[int] = None
+        self._prev_lru_key: Optional[list] = None
         self.model = model
         self.draft_model: Optional[nn.Module] = None
         self.max_kv_size = max_kv_size
@@ -192,6 +193,7 @@ class CacheWrapper:
         self._prefill_checkpoint = None
         self._prev_gdn_snapshot = None
         self._prev_kv_len = None
+        self._prev_lru_key = None
         self.cache: List[Any] = make_prompt_cache(self.model)
         if draft_model is not None:
             self.cache += make_prompt_cache(draft_model)
@@ -207,6 +209,7 @@ class CacheWrapper:
         self._prefill_checkpoint = None
         self._prev_gdn_snapshot = None
         self._prev_kv_len = None
+        self._prev_lru_key = None
         self.cache = self.cache[: len(self.model.layers)]
 
     def _checkpoint_offset(self, tokens: list) -> int:
@@ -333,7 +336,13 @@ class CacheWrapper:
             )
             return cache, start
 
-        if self._prev_kv_len is not None and self.cache is not None:
+        if (
+            self._prev_kv_len is not None
+            and self.cache is not None
+            and self._prev_lru_key is not None
+            and self._prev_kv_len <= len(token_list)
+            and norm_tokens[: len(self._prev_lru_key)] == self._prev_lru_key
+        ):
             self._lru = LRUPromptCache(max_size=1)
             return self.cache, self._prev_kv_len
 
@@ -530,6 +539,7 @@ class CacheWrapper:
         # Preserve prev-checkpoint before _restore_and_insert clears it.
         self._prev_gdn_snapshot = cp.gdn_snapshot
         self._prev_kv_len = cp.kv_len
+        self._prev_lru_key = cp.lru_key
         self._restore_and_insert(cp.gdn_snapshot, cp.lru_key, n_to_trim)
         kv_offset = next((c.offset for c in self.cache if isinstance(c, KVCache)), -1)
         lru_size_after = len(self._lru)
