@@ -446,59 +446,79 @@ class CacheWrapper:
         checkpoint_end = min(effective_checkpoint - cached_tokens, len(prefill_tokens))
 
         with mx.stream(generation_stream):
-            if self.draft_model is not None:
-                draft_cache = cache[len(self.model.layers) :]
-                self._prefill(
-                    model=self.draft_model,
-                    cache=draft_cache,
-                    tokens=prefill_tokens,
-                    reporter=reporter,
-                    is_draft=True,
+            try:
+                if self.draft_model is not None:
+                    draft_cache = cache[len(self.model.layers) :]
+                    self._prefill(
+                        model=self.draft_model,
+                        cache=draft_cache,
+                        tokens=prefill_tokens,
+                        reporter=reporter,
+                        is_draft=True,
+                    )
+
+                main_cache = cache[: len(self.model.layers)]
+                phase1 = prefill_tokens[:checkpoint_end]
+                phase2 = prefill_tokens[checkpoint_end:]
+
+                # Phase 1: prefill up to checkpoint.
+                if phase1.size > 0:
+                    self._prefill(
+                        model=self.model,
+                        cache=main_cache,
+                        tokens=phase1,
+                        reporter=reporter,
+                        is_draft=False,
+                    )
+
+                # GDN snapshot at checkpoint boundary (before <think>).
+                # KV layers are trimmed back to this point in finalize_generation();
+                # ArraysCache (GDN) layers are restored from this snapshot in-place.
+                gdn_snapshot = [
+                    copy.deepcopy(c) if isinstance(c, ArraysCache) else None
+                    for c in cache
+                ]
+                # LRU key in normalized space; bisect maps the checkpoint boundary.
+                norm_tokens, norm_orig = self._normalize_think_tokens(token_list)
+                if len(norm_tokens) < len(token_list):
+                    norm_cp = bisect.bisect_left(norm_orig, effective_checkpoint)
+                    lru_key = norm_tokens[:norm_cp]
+                else:
+                    lru_key = token_list[:effective_checkpoint]
+                self._prefill_checkpoint = _PrefillCheckpoint(
+                    gdn_snapshot=gdn_snapshot,
+                    lru_key=lru_key,
+                    kv_len=effective_checkpoint,
                 )
 
-            main_cache = cache[: len(self.model.layers)]
-            phase1 = prefill_tokens[:checkpoint_end]
-            phase2 = prefill_tokens[checkpoint_end:]
-
-            # Phase 1: prefill up to checkpoint.
-            if phase1.size > 0:
-                self._prefill(
-                    model=self.model,
-                    cache=main_cache,
-                    tokens=phase1,
-                    reporter=reporter,
-                    is_draft=False,
-                )
-
-            # GDN snapshot at checkpoint boundary (before <think>).
-            # KV layers are trimmed back to this point in finalize_generation();
-            # ArraysCache (GDN) layers are restored from this snapshot in-place.
-            gdn_snapshot = [
-                copy.deepcopy(c) if isinstance(c, ArraysCache) else None for c in cache
-            ]
-            # LRU key in normalized space; bisect maps the checkpoint boundary.
-            norm_tokens, norm_orig = self._normalize_think_tokens(token_list)
-            if len(norm_tokens) < len(token_list):
-                norm_cp = bisect.bisect_left(norm_orig, effective_checkpoint)
-                lru_key = norm_tokens[:norm_cp]
-            else:
-                lru_key = token_list[:effective_checkpoint]
-            self._prefill_checkpoint = _PrefillCheckpoint(
-                gdn_snapshot=gdn_snapshot,
-                lru_key=lru_key,
-                kv_len=effective_checkpoint,
-            )
-
-            # Phase 2: prefill from checkpoint to end (the <think>\n tokens).
-            if phase2.size > 0:
-                self._prefill(
-                    model=self.model,
-                    cache=main_cache,
-                    tokens=phase2,
-                    reporter=reporter,
-                    is_draft=False,
-                    progress_offset=checkpoint_end,
-                )
+                # Phase 2: prefill from checkpoint to end (the <think>\n tokens).
+                if phase2.size > 0:
+                    self._prefill(
+                        model=self.model,
+                        cache=main_cache,
+                        tokens=phase2,
+                        reporter=reporter,
+                        is_draft=False,
+                        progress_offset=checkpoint_end,
+                    )
+            except StopPromptProcessing:
+                if (
+                    self._prefill_checkpoint is None
+                    and self._prev_gdn_snapshot is not None
+                ):
+                    # Cancelled before checkpoint: roll back self.cache to the
+                    # previous turn's state and re-insert into LRU.
+                    kv_layer = next(
+                        (c for c in self.cache if isinstance(c, KVCache)), None
+                    )
+                    n_to_trim = (kv_layer.offset - self._prev_kv_len) if kv_layer else 0
+                    self._restore_and_insert(
+                        self._prev_gdn_snapshot, self._prev_lru_key, n_to_trim
+                    )
+                    logger.info(
+                        "[kv] prefill cancelled, rolled back to previous checkpoint"
+                    )
+                raise
 
         reporter.finish(is_draft=False)
 
