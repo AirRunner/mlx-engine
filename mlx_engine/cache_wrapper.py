@@ -18,6 +18,7 @@ from mlx_lm.models.cache import (
 )
 
 from mlx_engine.cache_plugins import find_boundary
+from mlx_engine.cache_plugins._base import find_conversation_start
 from mlx_engine.disk_kv_cache import DiskKVCacheStore
 from mlx_engine.utils.prompt_progress_reporter import (
     PromptProgressReporter,
@@ -89,17 +90,10 @@ def _find_system_prompt_boundary(
         return result, plugin_name
 
     # 2. Generic ChatML fallback.
-    try:
-        vocab = tokenizer.get_vocab()
-    except Exception:
-        return None, None
-    im_start_id = vocab.get("<|im_start|>")
-    if im_start_id is None:
-        return None, None
-    positions = [i for i, t in enumerate(prompt_tokens) if t == im_start_id]
-    if len(positions) < 2:
-        return None, None
-    return positions[1], None
+    conv_start = find_conversation_start(prompt_tokens, tokenizer)
+    if conv_start is not None:
+        return conv_start, None
+    return None, None
 
 
 class CacheWrapper:
