@@ -419,10 +419,11 @@ def _try_inject_pre_image_cache(
 ) -> tuple:
     """Try to reuse pre-image KV state from CacheWrapper to seed the miss prefill.
 
-    Delegates prefix matching to the LRU in CacheWrapper. Returns a deepcopy of
-    the best matching cached prefix so the prefill can start from there instead
-    of position 0. Works for both trimmable and non-trimmable caches via the
-    LRU shorter-match fallback.
+    Delegates prefix matching to CacheWrapper._find_starting_cache, which
+    normalizes think tokens before querying the LRU so that stored keys
+    (which strip <think>...</think> blocks) match correctly against the raw
+    pre-image tokens. Falls back to a direct cw.tokens scan only for
+    same-conversation ArraysCache misses (context truncation).
 
     Returns:
         (cache, n_cached_tokens) or (None, 0) when no reuse is possible.
@@ -439,25 +440,22 @@ def _try_inject_pre_image_cache(
         return None, 0
 
     pre_image = input_ids_list[:first_img]
-    cache, remaining = cw._lru.fetch_nearest_cache("main", pre_image)
 
-    if cache is not None:
-        n_cached = first_img - len(remaining)
-        if n_cached > 0:
-            logger.info(
-                f"[kv-image] pre-image LRU hit: {n_cached}/{first_img} tokens reused"
-            )
-            return cache, n_cached
+    # Delegate to _find_starting_cache so that think-normalized LRU keys are
+    # matched correctly. Raw fetch_nearest_cache would diverge at the first
+    # <think> token because LRU keys are stored without think blocks.
+    cache, n_cached = cw._find_starting_cache(pre_image)
+    if cache is not None and n_cached > 0:
+        logger.info(
+            f"[kv-image] pre-image LRU hit: {n_cached}/{first_img} tokens reused"
+        )
+        return cache, n_cached
 
-    # LRU returned None: no entry, or stored key longer than common prefix with
-    # a non-trimmable cache (mixed KV + ArraysCache). Fallback: find common prefix
-    # manually and trim KV layers in-place on cw.cache. ArraysCache layers are left
-    # at their current position; the error is bounded by the number of diverged
-    # tokens (typically a few tens due to context truncation) and is negligible.
-    #
-    # No deepcopy: cw.cache and the LRU entry are the same Python object. We reset
-    # the LRU to release its reference, dropping the ref count back to 1, so VRAM
-    # stays at 1x throughout the image prefill.
+    # _find_starting_cache returned None: LRU and prev-checkpoint both missed.
+    # Last-resort: scan cw.tokens for a common prefix and trim KV layers in-place.
+    # Only valid for same-conversation ArraysCache misses (context truncation,
+    # a few tens of tokens). Reject when the positional match ratio is too low:
+    # that signals a different conversation in cw.tokens.
     cw_tokens = cw.tokens
     if cw_tokens is None or cw.cache is None:
         return None, 0
@@ -477,8 +475,6 @@ def _try_inject_pre_image_cache(
             if isinstance(c, KVCache):
                 c.trim(to_trim)
 
-    # Release the LRU's reference (same object as cw.cache) so the trie overhead
-    # is freed and ref count stays at 1.
     cw._lru = LRUPromptCache(max_size=1)
 
     logger.info(
