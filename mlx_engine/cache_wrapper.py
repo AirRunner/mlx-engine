@@ -3,7 +3,7 @@ import copy
 import logging
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -12,7 +12,9 @@ from mlx_lm.models.cache import (
     ArraysCache,
     KVCache,
     LRUPromptCache,
+    can_trim_prompt_cache,
     make_prompt_cache,
+    trim_prompt_cache,
 )
 
 from mlx_engine.utils.prompt_progress_reporter import (
@@ -22,6 +24,13 @@ from mlx_engine.utils.prompt_progress_reporter import (
 
 
 PROMPT_PROCESSING_CHUNK_SIZE = 2048
+
+# Checkpoint N tokens before end of prompt
+# This value is at parity with mlx-lm:
+# https://github.com/ml-explore/mlx-lm/blob/d9c63f/mlx_lm/server.py#L587
+DEFAULT_CHECKPOINT_TAIL_TOKENS = 11
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -37,18 +46,6 @@ class _PrefillCheckpoint:
 
 
 def validate_prefill_step_size(prefill_step_size: Optional[int] = None) -> int:
-    """
-    Resolve and validate the configured prefill chunk size.
-
-    Args:
-        prefill_step_size: Optional override for tokens processed per prefill chunk.
-
-    Returns:
-        int: The provided chunk size, or PROMPT_PROCESSING_CHUNK_SIZE when unset.
-
-    Raises:
-        ValueError: If prefill_step_size is not a positive integer.
-    """
     if prefill_step_size is None:
         return PROMPT_PROCESSING_CHUNK_SIZE
     if (
@@ -58,9 +55,6 @@ def validate_prefill_step_size(prefill_step_size: Optional[int] = None) -> int:
     ):
         raise ValueError("prefill_step_size must be a positive integer")
     return prefill_step_size
-
-
-logger = logging.getLogger(__name__)
 
 
 def _vram_str(kv_cache: list | None = None) -> str:
@@ -74,10 +68,6 @@ def _vram_str(kv_cache: list | None = None) -> str:
 
 
 class CacheWrapper:
-    """
-    Wrapper class for the MLX LM cache to maintain an in-memory cache
-    """
-
     def __init__(
         self,
         model: nn.Module,
@@ -87,154 +77,86 @@ class CacheWrapper:
         kv_group_size: Optional[int] = None,
         quantized_kv_start: Optional[int] = None,
         chunk_size: int,
+        checkpoint_tail_tokens: int = DEFAULT_CHECKPOINT_TAIL_TOKENS,
+        history_capacity: int = 10,
         tokenizer=None,
     ):
-        """
-        Initialize the CacheWrapper.
-
-        Args:
-            model (nn.Module): The model to be cached.
-            max_kv_size (Optional[int]): Maximum size of the key-value cache.
-            chunk_size (int): Number of tokens per prefill chunk.
-        """
-        self.tokens: Optional[mx.array] = None
-        self.cache: List[Any] = make_prompt_cache(model, max_kv_size)
-        self._lru: LRUPromptCache = LRUPromptCache(max_size=1)
-        # Set by update_cache, consumed by finalize_generation.
-        # Set by update_cache, consumed and cleared by finalize_generation.
-        self._prefill_checkpoint: Optional[_PrefillCheckpoint] = None
-        # Checkpoint from the last finalized turn, used as fallback when both
-        # LRU and disk miss: restore and prefill only the delta.
-        self._prev_gdn_snapshot: Optional[List] = None
-        self._prev_kv_len: Optional[int] = None
-        self._prev_lru_key: Optional[list] = None
         self.model = model
-        self.draft_model: Optional[nn.Module] = None
-        self.max_kv_size = max_kv_size
-        self.kv_cache_qtn_params = dict(
+        self._draft_model: Optional[nn.Module] = None
+        self._max_kv_size = max_kv_size
+        self._chunk_size = chunk_size
+        self._checkpoint_tail_tokens = checkpoint_tail_tokens
+        self._history_capacity = history_capacity
+        self._kv_cache_qtn_params = dict(
             kv_bits=kv_bits,
             kv_group_size=kv_group_size,
             quantized_kv_start=quantized_kv_start,
         )
-        self.chunk_size = chunk_size
-        self._image_store: Optional[ImageCheckpointStore] = None
+
+        self._history = self._make_history()
+        self._history_key = "session"
+        self._live_tokens: Optional[mx.array] = None
+        self._live_cache: List[Any] = self._make_cache()
+
+        # Set by update_cache, consumed and cleared by finalize_generation.
+        self._prefill_checkpoint: Optional[_PrefillCheckpoint] = None
+        # Checkpoint from the last finalized turn, used as fallback when the
+        # LRU misses: restore and prefill only the delta.
+        self._prev_checkpoint: Optional[_PrefillCheckpoint] = None
+        # Optional image checkpoint store, activated by ModelKit when a
+        # VisionAddOn is present.
+        self._image_store: Optional["ImageCheckpointStore"] = None
         self._tokenizer = tokenizer
 
-    def _prefill(
+    @property
+    def cache(self) -> List[Any]:
+        return self._live_cache
+
+    @cache.setter
+    def cache(self, value: List[Any]) -> None:
+        self._live_cache = value
+
+    @property
+    def tokens(self) -> Optional[mx.array]:
+        return self._live_tokens
+
+    @tokens.setter
+    def tokens(self, value: Optional[mx.array]) -> None:
+        self._live_tokens = value
+
+    def _make_cache(self) -> List[Any]:
+        cache = make_prompt_cache(self.model, self._max_kv_size)
+        if self._draft_model is not None:
+            cache += make_prompt_cache(self._draft_model)
+        return cache
+
+    def _make_history(self) -> LRUPromptCache:
+        # Store up to N checkpoints. This number can be tuned (or made configurable) if
+        # it's too high or low
+        return LRUPromptCache(max_size=self._history_capacity)
+
+    def _num_tokens_in_cache(self, cache: Optional[List[Any]] = None) -> int | None:
+        cache = self._live_cache if cache is None else cache
+        for entry in cache:
+            if hasattr(entry, "offset"):
+                return entry.offset
+        return None
+
+    def _store_snapshot(
         self,
-        model,
-        cache,
-        tokens,
-        reporter: PromptProgressReporter,
-        is_draft: bool,
+        tokens: mx.array,
+        cache: List[Any],
         *,
-        progress_offset: int = 0,
-    ):
-        """
-        Fill a KV cache for a specific model
-
-        Args:
-            model: The model to use for cache filling
-            cache: The cache to fill
-            tokens: Tokens to process
-            reporter: Reporter for reporting progress
-            is_draft: Whether this is draft model prefill (True) or main model (False)
-        """
-        remaining_tokens = tokens
-        num_processed = progress_offset
-
-        while remaining_tokens.size > 0:
-            current_chunk_size = min(self.chunk_size, remaining_tokens.size)
-            current_chunk = remaining_tokens[:current_chunk_size]
-
-            model(current_chunk[None], cache=cache)
-            maybe_quantize_kv_cache(prompt_cache=cache, **self.kv_cache_qtn_params)
-            mx.eval([c.state for c in cache])
-
-            remaining_tokens = remaining_tokens[current_chunk_size:]
-            num_processed += current_chunk_size
-
-            mx.clear_cache()
-
-            # Report progress
-            should_continue = reporter.update(is_draft, num_processed)
-            if not should_continue:
-                logger.info("Prompt processing was cancelled by the user.")
-                raise StopPromptProcessing
-
-    def set_draft_model(self, draft_model: nn.Module):
-        """
-        Sets or updates the draft model to use in the cache.
-
-        If the provided draft_model is already set, returns without changes.
-        Otherwise, clears existing cache and rebuilds it by combining caches
-        from the main model and draft model. Requires a main model to be set first.
-        Args:
-            draft_model: The draft model to cache. Pass None to remove draft model.
-
-        Raises:
-            ValueError: If main model hasn't been set yet.
-        """
-        if self.model is None:
-            raise ValueError("Cannot add a draft model to cache without a main model")
-        if self.max_kv_size is not None:
-            logger.info("Disabling max_kv_size when setting a draft model for cache")
-            self.max_kv_size = None
-
-        if self.draft_model is draft_model:
-            # Skip if the exact same draft model instance is already in cache
+        cache_type: Literal["user", "assistant"],
+    ) -> None:
+        if tokens.size == 0:
             return
-
-        # clear the current cache, append draft model cache to the end of the main model cache as per
-        # https://github.com/ml-explore/mlx-examples/blob/514502da22f0dc4c1ac439bdf78c07d5ec41acf7/llms/mlx_lm/utils.py#L381-L382
-        logger.info("Clearing current prompt cache and adding draft model to the cache")
-        self.tokens = None
-        self._lru = LRUPromptCache(max_size=1)
-        self._prefill_checkpoint = None
-        self._prev_gdn_snapshot = None
-        self._prev_kv_len = None
-        self._prev_lru_key = None
-        self.cache: List[Any] = make_prompt_cache(self.model)
-        if draft_model is not None:
-            self.cache += make_prompt_cache(draft_model)
-        self.draft_model = draft_model
-
-    def unset_draft_model(self):
-        """Removes the draft model from the cache if one exists."""
-        if self.draft_model is None:
-            return
-        self.draft_model = None
-        self.tokens = None
-        self._lru = LRUPromptCache(max_size=1)
-        self._prefill_checkpoint = None
-        self._prev_gdn_snapshot = None
-        self._prev_kv_len = None
-        self._prev_lru_key = None
-        self.cache = self.cache[: len(self.model.layers)]
-
-    def _checkpoint_offset(self, tokens: list) -> int:
-        """Number of trailing tokens excluded from the LRU checkpoint key.
-
-        For thinking models the key ends before the generation-prompt prefix
-        (role header + <think>) so that the stored key is a valid prefix of
-        the next turn's prompt regardless of role.
-
-        The number of tokens between the role header and <think> (inclusive)
-        is read from ``tokenizer.thinking_prefix_offset`` (default 3 for
-        ChatML-based templates).
-
-        Falls back to 1 for non-thinking models.
-        """
-        if self._tokenizer is not None and getattr(
-            self._tokenizer, "has_thinking", False
-        ):
-            think_id = getattr(self._tokenizer, "think_start_id", None)
-            if think_id is not None:
-                prefix_len = getattr(self._tokenizer, "thinking_prefix_offset", 3)
-                for i in range(1, min(11, len(tokens))):
-                    if tokens[-i] == think_id:
-                        return i + prefix_len
-        return 1
+        self._history.insert_cache(
+            self._history_key,
+            tokens.tolist(),
+            copy.deepcopy(cache),
+            cache_type=cache_type,
+        )
 
     def _normalize_think_tokens(self, tokens: list) -> tuple[list, list[int]]:
         """Strip complete <think>...</think> blocks for think-invariant LRU keys.
@@ -301,60 +223,323 @@ class CacheWrapper:
                 i += 1
         return result, orig_indices
 
-    def _find_starting_cache(
-        self, token_list: list, *, prefer_prev_checkpoint: bool = False
-    ) -> tuple[Any, int]:
-        """Return (cache, start_idx) for the best available prefix of token_list.
+    def _checkpoint_offset(self, tokens: list) -> int:
+        """Number of trailing tokens excluded from the LRU checkpoint key.
 
-        Checks, in order: prev-checkpoint (if preferred), LRU, prev-checkpoint
-        (fallback). Evicts the LRU when a cache is returned so VRAM stays at 1x.
-        Returns (None, 0) when no cached prefix is available.
+        For thinking models the key ends before the generation-prompt prefix
+        (role header + <think>) so that the stored key is a valid prefix of
+        the next turn's prompt regardless of role.
 
-        Args:
-            token_list:             Full prompt as a flat Python list.
-            prefer_prev_checkpoint: When True, try prev-checkpoint before the LRU.
-                                    Use this in the image path to avoid the deepcopy
-                                    that fetch_nearest_cache performs.
+        The number of tokens between the role header and <think> (inclusive)
+        is read from ``tokenizer.thinking_prefix_offset`` (default 3 for
+        ChatML-based templates).
+
+        Falls back to _checkpoint_tail_tokens for non-thinking models.
         """
-        if (
-            prefer_prev_checkpoint
-            and self._prev_kv_len is not None
-            and self.cache is not None
+        if self._tokenizer is not None and getattr(
+            self._tokenizer, "has_thinking", False
         ):
-            self._lru = LRUPromptCache(max_size=1)
-            return self.cache, self._prev_kv_len
+            think_id = getattr(self._tokenizer, "think_start_id", None)
+            if think_id is not None:
+                prefix_len = getattr(self._tokenizer, "thinking_prefix_offset", 3)
+                for i in range(1, min(11, len(tokens))):
+                    if tokens[-i] == think_id:
+                        return i + prefix_len
+        return self._checkpoint_tail_tokens
 
+    def _restore_cache(
+        self,
+        prompt_tokens: mx.array,
+    ) -> tuple[Optional[List[Any]], mx.array]:
+        if len(prompt_tokens) == 0:
+            return None, prompt_tokens
+
+        token_list = prompt_tokens.tolist()
         norm_tokens, norm_orig = self._normalize_think_tokens(token_list)
-        cache, remaining_norm = self._lru.fetch_nearest_cache("main", norm_tokens)
+
+        # Think-normalized LRU lookup.
+        cache, remaining_norm = self._history.fetch_nearest_cache(
+            self._history_key,
+            norm_tokens,
+        )
         if cache is not None:
-            self._lru = LRUPromptCache(max_size=1)
             cached_norm = len(norm_tokens) - len(remaining_norm)
             start = (
                 norm_orig[cached_norm]
                 if cached_norm < len(norm_orig)
                 else len(token_list)
             )
-            return cache, start
+            if start < len(token_list):
+                return cache, prompt_tokens[start:]
 
+            # Exact hit: try to trim 1 token to seed decode.
+            if can_trim_prompt_cache(cache) and trim_prompt_cache(cache, 1) == 1:
+                return cache, prompt_tokens[-1:]
+
+        if len(prompt_tokens) <= 1:
+            return None, prompt_tokens
+
+        # Exact hits need one token outside the cache to seed decode. If the
+        # exact-hit cache cannot be trimmed, retry with one less prompt token
+        # so a stored checkpoint can win.
+        truncated_norm, truncated_orig = self._normalize_think_tokens(token_list[:-1])
+        cache, rest = self._history.fetch_nearest_cache(
+            self._history_key,
+            truncated_norm,
+        )
+        if cache is not None:
+            cached_norm = len(truncated_norm) - len(rest)
+            start = (
+                truncated_orig[cached_norm]
+                if cached_norm < len(truncated_orig)
+                else len(token_list) - 1
+            )
+            return cache, prompt_tokens[start:]
+
+        # Prev-checkpoint fallback: if LRU missed but the current prompt
+        # shares the same normalized prefix as the last finalized turn,
+        # reuse the live cache directly (no deepcopy) and prefill the delta.
         if (
-            self._prev_kv_len is not None
-            and self.cache is not None
-            and self._prev_lru_key is not None
-            and self._prev_kv_len <= len(token_list)
-            and norm_tokens[: len(self._prev_lru_key)] == self._prev_lru_key
+            self._prev_checkpoint is not None
+            and self._live_cache is not None
+            and self._prev_checkpoint.kv_len <= len(token_list)
+            and norm_tokens[: len(self._prev_checkpoint.lru_key)]
+            == self._prev_checkpoint.lru_key
         ):
-            self._lru = LRUPromptCache(max_size=1)
-            return self.cache, self._prev_kv_len
+            return self._live_cache, prompt_tokens[self._prev_checkpoint.kv_len :]
 
-        return None, 0
+        return None, prompt_tokens
+
+    def _prefill_cache(
+        self,
+        model: nn.Module,
+        cache: List[Any],
+        cache_start: int,
+        tokens: mx.array,
+        reporter: PromptProgressReporter,
+        is_draft: bool,
+        checkpoint_prefix_len: Optional[int] = None,
+    ) -> None:
+        remaining_tokens = tokens
+        num_processed = 0
+        stored_checkpoint = False
+
+        while remaining_tokens.size > 0:
+            current_chunk_size = min(self._chunk_size, remaining_tokens.size)
+            current_cache_size = self._num_tokens_in_cache(cache)
+            if (
+                checkpoint_prefix_len is not None
+                and current_cache_size is not None
+                and current_cache_size < checkpoint_prefix_len
+                and current_cache_size + current_chunk_size > checkpoint_prefix_len
+            ):
+                current_chunk_size = checkpoint_prefix_len - current_cache_size
+
+            current_chunk = remaining_tokens[:current_chunk_size]
+            model(current_chunk[None], cache=cache)
+            maybe_quantize_kv_cache(prompt_cache=cache, **self._kv_cache_qtn_params)
+            self._live_cache[cache_start : cache_start + len(cache)] = cache
+            mx.eval([entry.state for entry in cache])
+
+            remaining_tokens = remaining_tokens[current_chunk_size:]
+            num_processed += current_chunk_size
+            mx.clear_cache()
+
+            current_cache_size = self._num_tokens_in_cache(cache)
+            if (
+                checkpoint_prefix_len is not None
+                and not stored_checkpoint
+                and current_cache_size == checkpoint_prefix_len
+            ):
+                # GDN snapshot at checkpoint boundary (before <think>).
+                # KV layers are trimmed back to this point in finalize_generation();
+                # ArraysCache (GDN) layers are restored from this snapshot in-place.
+                gdn_snapshot = [
+                    copy.deepcopy(c) if isinstance(c, ArraysCache) else None
+                    for c in self._live_cache
+                ]
+                token_list = self._live_tokens.tolist()
+                norm_tokens, norm_orig = self._normalize_think_tokens(token_list)
+                if len(norm_tokens) < len(token_list):
+                    norm_cp = bisect.bisect_left(norm_orig, checkpoint_prefix_len)
+                    lru_key = norm_tokens[:norm_cp]
+                else:
+                    lru_key = token_list[:checkpoint_prefix_len]
+                self._prefill_checkpoint = _PrefillCheckpoint(
+                    gdn_snapshot=gdn_snapshot,
+                    lru_key=lru_key,
+                    kv_len=checkpoint_prefix_len,
+                )
+                stored_checkpoint = True
+
+            if not reporter.update(is_draft, num_processed):
+                logger.info("Prompt processing was cancelled by the user.")
+                live_cache_size = self._num_tokens_in_cache()
+                if live_cache_size is None:
+                    self._live_tokens = None
+                    self._live_cache = self._make_cache()
+                else:
+                    self._live_tokens = self._live_tokens[:live_cache_size]
+                raise StopPromptProcessing
+
+    def update_cache(
+        self,
+        prompt_tokens: mx.array,
+        reporter: PromptProgressReporter,
+        *,
+        num_tokens_to_exclude: int = 1,
+    ) -> mx.array:
+        num_tokens_to_exclude = max(num_tokens_to_exclude, 1)
+        total_prompt_tokens = len(prompt_tokens)
+        token_list = prompt_tokens.tolist()
+
+        # If the generator from the previous turn was not exhausted by the caller
+        # (early stop after receiving stop_condition), finalize_generation was never
+        # called. Do it now before starting the new prefill.
+        if self._prefill_checkpoint is not None:
+            self.finalize_generation()
+
+        restored_cache, uncached_tokens = self._restore_cache(prompt_tokens)
+        self._live_cache = (
+            restored_cache if restored_cache is not None else self._make_cache()
+        )
+        self._live_tokens = prompt_tokens
+
+        cached_tokens = total_prompt_tokens - len(uncached_tokens)
+        logger.info(
+            "Prompt cache: using %d/%d tokens from cache",
+            cached_tokens,
+            total_prompt_tokens,
+        )
+
+        reporter.begin(
+            is_draft=False,
+            cached_tokens=cached_tokens,
+            total_prompt_tokens=total_prompt_tokens,
+            prefill_tokens_processed=0,
+        )
+
+        # Leave num_tokens_to_exclude tokens outside the cache to seed decode.
+        num_tokens_to_exclude = min(num_tokens_to_exclude, len(uncached_tokens))
+        prefill_tokens = uncached_tokens[:-num_tokens_to_exclude]
+
+        # Checkpoint position: for thinking models, exclude trailing <think>
+        # tokens so the stored key is a stable prefix of the next turn's query.
+        # For non-thinking models, fall back to _checkpoint_tail_tokens (11).
+        checkpoint_offset = self._checkpoint_offset(token_list)
+        checkpoint_prefix_len = total_prompt_tokens - checkpoint_offset
+        # Cannot go before what's already cached, and skip if non-positive.
+        if checkpoint_prefix_len <= cached_tokens or checkpoint_prefix_len <= 0:
+            checkpoint_prefix_len = None
+        # Only checkpoint the main-model path; quantized caches skip checkpointing.
+        if (
+            self._draft_model is not None
+            or self._kv_cache_qtn_params["kv_bits"] is not None
+        ):
+            checkpoint_prefix_len = None
+
+        with mx.stream(generation_stream):
+            try:
+                if self._draft_model is not None:
+                    draft_cache = self._live_cache[len(self.model.layers) :]
+                    self._prefill_cache(
+                        model=self._draft_model,
+                        cache=draft_cache,
+                        cache_start=len(self.model.layers),
+                        tokens=prefill_tokens,
+                        reporter=reporter,
+                        is_draft=True,
+                        checkpoint_prefix_len=None,
+                    )
+
+                main_cache = self._live_cache[: len(self.model.layers)]
+                self._prefill_cache(
+                    model=self.model,
+                    cache=main_cache,
+                    cache_start=0,
+                    tokens=prefill_tokens,
+                    reporter=reporter,
+                    is_draft=False,
+                    checkpoint_prefix_len=checkpoint_prefix_len,
+                )
+            except StopPromptProcessing:
+                if (
+                    self._prefill_checkpoint is None
+                    and self._prev_checkpoint is not None
+                ):
+                    # Cancelled before checkpoint: roll back to the previous
+                    # turn's state and re-insert into the history.
+                    kv_layer = next(
+                        (c for c in self._live_cache if isinstance(c, KVCache)), None
+                    )
+                    n_to_trim = (
+                        (kv_layer.offset - self._prev_checkpoint.kv_len)
+                        if kv_layer
+                        else 0
+                    )
+                    self._restore_and_insert(
+                        self._prev_checkpoint.gdn_snapshot,
+                        self._prev_checkpoint.lru_key,
+                        n_to_trim,
+                    )
+                    logger.info(
+                        "[kv] prefill cancelled, rolled back to previous checkpoint"
+                    )
+                raise
+
+        reporter.finish(is_draft=False)
+        logger.info(
+            f"[kv] prefill done tokens={total_prompt_tokens} {_vram_str(self._live_cache)}"
+        )
+        return uncached_tokens[-num_tokens_to_exclude:]
+
+    def _restore_and_insert(
+        self, gdn_snapshot: list, lru_key: list, n_to_trim: int
+    ) -> None:
+        """Restore GDN layers from snapshot, trim KV layers, and insert into history."""
+        for c, snap in zip(self._live_cache, gdn_snapshot):
+            if snap is not None:
+                c.cache = snap.cache
+            else:
+                c.trim(n_to_trim)
+        lru_key_arr = mx.array(lru_key)
+        self._store_snapshot(lru_key_arr, self._live_cache, cache_type="user")
+        self._prefill_checkpoint = None
+
+    def finalize_generation(self) -> None:
+        """Restore cache to post-prefill state and insert into history.
+
+        Called after stream_generate completes (or is cancelled). Trims KV layers
+        back to the prefill boundary and restores ArraysCache (GDN) layers from the
+        snapshot taken in _prefill_cache. The resulting clean cache is stored in the
+        history for next-turn prefix reuse.
+        """
+        if self._prefill_checkpoint is None or self._live_tokens is None:
+            return
+        cp = self._prefill_checkpoint
+        n_to_trim = len(self._live_tokens) - cp.kv_len
+        # Preserve prev-checkpoint before _restore_and_insert clears it.
+        self._prev_checkpoint = _PrefillCheckpoint(
+            gdn_snapshot=cp.gdn_snapshot,
+            lru_key=cp.lru_key,
+            kv_len=cp.kv_len,
+        )
+        self._restore_and_insert(cp.gdn_snapshot, cp.lru_key, n_to_trim)
+        kv_offset = next(
+            (c.offset for c in self._live_cache if isinstance(c, KVCache)), -1
+        )
+        logger.info(
+            f"[kv] finalize done key_len={len(cp.lru_key)} kv_offset={kv_offset}"
+            f" history_size={len(self._history)} {_vram_str(self._live_cache)}"
+        )
 
     def set_image_turn_checkpoint(
         self, cache: list, token_list: list, cached_tokens: int
     ) -> None:
         """Set _prefill_checkpoint after an image-path prefill.
 
-        Mirrors the checkpoint logic in update_cache so that finalize_generation
-        can trim KV layers, restore GDN layers, and insert into the LRU after an
+        Mirrors the checkpoint logic in _prefill_cache so that finalize_generation
+        can trim KV layers, restore GDN layers, and insert into the history after an
         image-turn generation completes.
 
         Args:
@@ -379,200 +564,67 @@ class CacheWrapper:
             gdn_snapshot=gdn_snapshot, lru_key=lru_key, kv_len=effective_checkpoint
         )
 
-    def update_cache(
-        self,
-        prompt_tokens: mx.array,
-        reporter: PromptProgressReporter,
-        *,
-        num_tokens_to_exclude: int = 1,
-    ) -> mx.array:
-        """
-        Set up the KV cache for the next generation, reusing as much of the
-        previous cache as possible.
+    def _find_starting_cache(
+        self, token_list: list, *, prefer_prev_checkpoint: bool = False
+    ) -> tuple[Any, int]:
+        """Return (cache, start_idx) for the best available prefix of token_list.
 
-        The LRU key is built from think-normalized tokens so that it matches
-        the next turn's query even when clients strip CoT blocks from history.
-        The key also ends just before any trailing open <think> token. The GDN
-        snapshot is taken at the same boundary so finalize_generation can
-        restore to that state.
+        Used by the image path in generate.py, which needs (cache, int) rather
+        than (cache, mx.array). Delegates to _restore_cache internally.
 
         Args:
-            prompt_tokens (mx.array): The prompt tokens.
-            reporter: Reporter for reporting prompt processing progress.
-            num_tokens_to_exclude (int): The number of tokens that should not be added to the cache.
-
-        Returns:
-            mx.array: The prompt tokens to be used for the next generation.
+            token_list:             Full prompt as a flat Python list.
+            prefer_prev_checkpoint: When True, try prev-checkpoint before the LRU.
         """
-        num_tokens_to_exclude = max(num_tokens_to_exclude, 1)
-        total_prompt_tokens = len(prompt_tokens)
-        token_list = prompt_tokens.tolist()
+        if (
+            prefer_prev_checkpoint
+            and self._prev_checkpoint is not None
+            and self._live_cache is not None
+        ):
+            return self._live_cache, self._prev_checkpoint.kv_len
 
-        # If the generator from the previous turn was not exhausted by the caller
-        # (early stop after receiving stop_condition), finalize_generation was never
-        # called. Do it now before starting the new prefill.
-        if self._prefill_checkpoint is not None:
-            self.finalize_generation()
-
-        cache, cached_by = self._find_starting_cache(token_list)
+        prompt_tokens = mx.array(token_list)
+        cache, rest = self._restore_cache(prompt_tokens)
         if cache is not None:
-            remaining = token_list[cached_by:]
-            logger.info(f"[kv] cache hit cached={cached_by}/{total_prompt_tokens}")
-        else:
-            cache = make_prompt_cache(self.model, self.max_kv_size)
-            remaining = token_list
+            start = len(token_list) - len(rest)
+            return cache, start
+        return None, 0
 
-        cached_tokens = total_prompt_tokens - len(remaining)
-
-        reporter.begin(
-            is_draft=False,
-            cached_tokens=cached_tokens,
-            total_prompt_tokens=total_prompt_tokens,
-            prefill_tokens_processed=0,
-        )
-
-        # Tokens to prefill: all remaining except the last num_tokens_to_exclude.
-        num_tokens_to_exclude = min(num_tokens_to_exclude, len(remaining))
-        remaining_arr = mx.array(remaining)
-        prefill_tokens = remaining_arr[:-num_tokens_to_exclude]
-
-        # LRU checkpoint: exclude trailing <think> tokens for thinking models
-        # so the stored key is a stable prefix of the next turn's query.
-        checkpoint_offset = self._checkpoint_offset(token_list)
-        checkpoint_idx = total_prompt_tokens - checkpoint_offset
-        # Cannot go before what's already cached.
-        effective_checkpoint = max(checkpoint_idx, cached_tokens)
-        # Position within prefill_tokens (0-based relative to cached_tokens).
-        checkpoint_end = min(effective_checkpoint - cached_tokens, len(prefill_tokens))
-
-        with mx.stream(generation_stream):
-            try:
-                if self.draft_model is not None:
-                    draft_cache = cache[len(self.model.layers) :]
-                    self._prefill(
-                        model=self.draft_model,
-                        cache=draft_cache,
-                        tokens=prefill_tokens,
-                        reporter=reporter,
-                        is_draft=True,
-                    )
-
-                main_cache = cache[: len(self.model.layers)]
-                phase1 = prefill_tokens[:checkpoint_end]
-                phase2 = prefill_tokens[checkpoint_end:]
-
-                # Phase 1: prefill up to checkpoint.
-                if phase1.size > 0:
-                    self._prefill(
-                        model=self.model,
-                        cache=main_cache,
-                        tokens=phase1,
-                        reporter=reporter,
-                        is_draft=False,
-                    )
-
-                # GDN snapshot at checkpoint boundary (before <think>).
-                # KV layers are trimmed back to this point in finalize_generation();
-                # ArraysCache (GDN) layers are restored from this snapshot in-place.
-                gdn_snapshot = [
-                    copy.deepcopy(c) if isinstance(c, ArraysCache) else None
-                    for c in cache
-                ]
-                # LRU key in normalized space; bisect maps the checkpoint boundary.
-                norm_tokens, norm_orig = self._normalize_think_tokens(token_list)
-                if len(norm_tokens) < len(token_list):
-                    norm_cp = bisect.bisect_left(norm_orig, effective_checkpoint)
-                    lru_key = norm_tokens[:norm_cp]
-                else:
-                    lru_key = token_list[:effective_checkpoint]
-                self._prefill_checkpoint = _PrefillCheckpoint(
-                    gdn_snapshot=gdn_snapshot,
-                    lru_key=lru_key,
-                    kv_len=effective_checkpoint,
-                )
-
-                # Phase 2: prefill from checkpoint to end (the <think>\n tokens).
-                if phase2.size > 0:
-                    self._prefill(
-                        model=self.model,
-                        cache=main_cache,
-                        tokens=phase2,
-                        reporter=reporter,
-                        is_draft=False,
-                        progress_offset=checkpoint_end,
-                    )
-            except StopPromptProcessing:
-                if (
-                    self._prefill_checkpoint is None
-                    and self._prev_gdn_snapshot is not None
-                ):
-                    # Cancelled before checkpoint: roll back self.cache to the
-                    # previous turn's state and re-insert into LRU.
-                    kv_layer = next(
-                        (c for c in self.cache if isinstance(c, KVCache)), None
-                    )
-                    n_to_trim = (kv_layer.offset - self._prev_kv_len) if kv_layer else 0
-                    self._restore_and_insert(
-                        self._prev_gdn_snapshot, self._prev_lru_key, n_to_trim
-                    )
-                    logger.info(
-                        "[kv] prefill cancelled, rolled back to previous checkpoint"
-                    )
-                raise
-
-        reporter.finish(is_draft=False)
-
-        # Give the cache directly to generation (no KV deepcopy).
-        # finalize_generation() will restore the clean state afterwards.
-        self.cache = cache
-        self.tokens = prompt_tokens
-        logger.info(
-            f"[kv] prefill done tokens={total_prompt_tokens} {_vram_str(cache)}"
-        )
-
-        return prompt_tokens[-num_tokens_to_exclude:]
-
-    def _restore_and_insert(
-        self, gdn_snapshot: list, lru_key: list, n_to_trim: int
-    ) -> None:
-        """Restore GDN layers from snapshot, trim KV layers, and insert into LRU."""
-        for c, snap in zip(self.cache, gdn_snapshot):
-            if snap is not None:
-                c.cache = snap.cache
-            else:
-                c.trim(n_to_trim)
-        self._lru.insert_cache("main", lru_key, self.cache)
-        self._prefill_checkpoint = None
-
-    def finalize_generation(self) -> None:
-        """Restore cache to post-prefill state and insert into LRU.
-
-        Called after stream_generate completes (or is cancelled). Trims KV layers
-        back to the prefill boundary and restores ArraysCache (GDN) layers from the
-        snapshot taken in update_cache. The resulting clean cache is stored in the
-        LRU for next-turn prefix reuse.
-        """
-        if self._prefill_checkpoint is None or self.tokens is None:
+    def record_generated_token(self, token: int) -> None:
+        if self._live_tokens is None:
+            self._live_tokens = mx.array([token])
             return
-        cp = self._prefill_checkpoint
-        n_to_trim = len(self.tokens) - cp.kv_len
-        # Preserve prev-checkpoint before _restore_and_insert clears it.
-        self._prev_gdn_snapshot = cp.gdn_snapshot
-        self._prev_kv_len = cp.kv_len
-        self._prev_lru_key = cp.lru_key
-        self._restore_and_insert(cp.gdn_snapshot, cp.lru_key, n_to_trim)
-        kv_offset = next((c.offset for c in self.cache if isinstance(c, KVCache)), -1)
-        lru_size_after = len(self._lru)
-        logger.info(
-            f"[kv] finalize done key_len={len(cp.lru_key)} kv_offset={kv_offset}"
-            f" lru_size={lru_size_after} {_vram_str(self.cache)}"
-        )
+        self._live_tokens = mx.concat([self._live_tokens, mx.array([token])])
 
-    def record_generated_token(self, token):
-        """
-        Add the generated token to the token list, so that we can map the token to the KV cache.
-        """
-        self.tokens = mx.concat([self.tokens, mx.array([token])])
+    def set_draft_model(self, draft_model: nn.Module) -> None:
+        if self.model is None:
+            raise ValueError("Cannot add a draft model to cache without a main model")
+        if self._draft_model is draft_model:
+            return
+        if self._max_kv_size is not None:
+            logger.info("Disabling max_kv_size when setting a draft model for cache")
+            self._max_kv_size = None
+
+        self._history = self._make_history()
+        self._draft_model = draft_model
+        self._live_tokens = None
+        self._live_cache = self._make_cache()
+        self._prefill_checkpoint = None
+        self._prev_checkpoint = None
+
+    def unset_draft_model(self) -> None:
+        if self._draft_model is None:
+            return
+        main_cache = self._live_cache[: len(self.model.layers)]
+        self._history = self._make_history()
+        self._draft_model = None
+        self._prefill_checkpoint = None
+        self._prev_checkpoint = None
+        if len(main_cache) == len(self.model.layers):
+            self._live_cache = main_cache
+            return
+        self._live_tokens = None
+        self._live_cache = self._make_cache()
 
 
 def image_block_boundaries(
@@ -614,7 +666,7 @@ class ImageCheckpointStore:
 
     def __init__(self) -> None:
         # key: tuple[str, ...] (per-image SHA-256 hash chain)
-        # value: (cache_snapshot, image_end_index: int, prefix_hash: int, block_lengths: tuple)
+        # value: (image_end_index: int, prefix_hash: int, block_lengths: tuple)
         self._image_checkpoints: dict[tuple, tuple] = {}
 
     def clear(self) -> None:
@@ -705,12 +757,6 @@ class ImageCheckpointStore:
         depth = len(check_key)
 
         # 1. Block-length gap check.
-        # Block lengths can change when dynamic resolution re-pads all images in
-        # a batch to the largest dimensions (e.g. 300→672 tokens when a larger
-        # second image is added). Extra padding tokens are semantically neutral
-        # and will be processed by the partial-hit prefill from stored_end_idx
-        # onwards. Only invalidate when the gap contains non-pad tokens,
-        # indicating a real content change.
         if (
             stored_block_lengths
             and current_block_lengths
@@ -780,21 +826,13 @@ class ImageCheckpointStore:
     ) -> None:
         """Compute per-block prefix hashes and persist image checkpoint metadata.
 
-        Abstracts the hash computation and key construction so callers do not
-        need to repeat this logic for both the full-miss and partial-hit paths.
-
         Args:
             hash_chain:        Full image hash chain for this turn.
-            offset:            Number of already-cached image blocks. Zero for
-                               a full miss; ``partial_depth`` for a partial hit.
-                               Checkpoint at index ``i`` is stored under
-                               ``hash_chain[:offset + i + 1]``.
+            offset:            Number of already-cached image blocks.
             block_checkpoints: List of ``image_end_index`` values (int), one per
                                newly processed image block.
             input_ids_flat:    Full VLM token sequence as a flat list.
-                               Used to compute prefix hashes at each boundary.
-            block_lengths:     Image block token counts for the full turn, used
-                               as a structural staleness check on the next turn.
+            block_lengths:     Image block token counts for the full turn.
         """
         for i, end_idx in enumerate(block_checkpoints):
             pfx_hash = hash(tuple(input_ids_flat[:end_idx]))
@@ -806,13 +844,7 @@ class ImageCheckpointStore:
             )
 
     def invalidate_image_checkpoint(self, key: tuple) -> None:
-        """
-        Remove a stale image checkpoint.
-
-        Called when the prefix hash of an existing checkpoint no longer matches
-        the current conversation, indicating that the KV positions stored in the
-        snapshot correspond to a different conversation and must not be reused.
-        """
+        """Remove a stale image checkpoint."""
         self._image_checkpoints.pop(key, None)
         logger.info(f"[kv-image] stale checkpoint invalidated depth={len(key)}")
 
@@ -865,8 +897,6 @@ class ImageCheckpointStore:
         ordered_hashes = list(best_key)
 
         # New images: entries not covered by the checkpoint, including duplicates.
-        # Use Counter so that an image sent N times with the same hash keeps
-        # (N - checkpoint_count) extra copies instead of being dropped entirely.
         checkpoint_counts = Counter(best_key)
         remaining = {
             h: max(0, cnt - checkpoint_counts.get(h, 0))

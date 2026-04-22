@@ -19,7 +19,6 @@ from mlx_lm.generate import stream_generate
 from mlx_lm.utils import load as mlx_lm_load
 from mlx_lm.models.cache import (
     KVCache,
-    LRUPromptCache,
     make_prompt_cache,
 )
 
@@ -475,7 +474,7 @@ def _try_inject_pre_image_cache(
             if isinstance(c, KVCache):
                 c.trim(to_trim)
 
-    cw._lru = LRUPromptCache(max_size=1)
+    cw._history = cw._make_history()
 
     logger.info(
         f"[kv-image] pre-image fallback: {common}/{first_img} tokens reused"
