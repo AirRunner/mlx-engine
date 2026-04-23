@@ -514,6 +514,11 @@ class CacheWrapper:
                 main_cache = self._live_cache[: len(self.model.layers)]
                 if boundary_idx is not None and 0 < boundary_idx < len(prefill_tokens):
                     # Split prefill at disk boundary: save snapshot between the two halves.
+                    # Route checkpoint to whichever half contains it, never both.
+                    cp_in_phase1 = (
+                        checkpoint_prefix_len is not None
+                        and checkpoint_prefix_len <= boundary_idx
+                    )
                     self._prefill_cache(
                         model=self.model,
                         cache=main_cache,
@@ -521,7 +526,7 @@ class CacheWrapper:
                         tokens=prefill_tokens[:boundary_idx],
                         reporter=reporter,
                         is_draft=False,
-                        checkpoint_prefix_len=checkpoint_prefix_len,
+                        checkpoint_prefix_len=checkpoint_prefix_len if cp_in_phase1 else None,
                     )
                     self._disk_store.maybe_save(
                         token_list[:boundary_idx], self._model_path, main_cache, plugin_name
@@ -533,7 +538,7 @@ class CacheWrapper:
                         tokens=prefill_tokens[boundary_idx:],
                         reporter=reporter,
                         is_draft=False,
-                        checkpoint_prefix_len=checkpoint_prefix_len,
+                        checkpoint_prefix_len=None if cp_in_phase1 else checkpoint_prefix_len,
                     )
                 else:
                     self._prefill_cache(
