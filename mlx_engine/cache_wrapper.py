@@ -431,11 +431,8 @@ class CacheWrapper:
         # Cannot go before what's already cached, and skip if non-positive.
         if checkpoint_prefix_len <= cached_tokens or checkpoint_prefix_len <= 0:
             checkpoint_prefix_len = None
-        # Only checkpoint the main-model path; quantized caches skip checkpointing.
-        if (
-            self._draft_model is not None
-            or self._kv_cache_qtn_params["kv_bits"] is not None
-        ):
+        # Only checkpoint the main-model path (not draft model).
+        if self._draft_model is not None:
             checkpoint_prefix_len = None
 
         with mx.stream(generation_stream):
@@ -487,7 +484,10 @@ class CacheWrapper:
                     )
                 raise
 
-        reporter.finish(is_draft=False)
+        reporter.finish(
+            is_draft=False,
+            prefill_tokens_processed=total_prompt_tokens - cached_tokens,
+        )
         logger.info(
             f"[kv] prefill done tokens={total_prompt_tokens} {_vram_str(self._live_cache)}"
         )
