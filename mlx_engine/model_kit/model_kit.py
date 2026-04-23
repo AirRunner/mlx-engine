@@ -110,6 +110,7 @@ class ModelKit:
             chunk_size=prefill_step_size,
             model_path=str(model_path),
             tokenizer=self.tokenizer,
+            history_capacity=3,
         )
         self.kv_bits = kv_bits
         self.kv_group_size = kv_group_size
