@@ -15,7 +15,8 @@ def get_kv_cache_quantization_params(
     Validates and processes KV cache quantization parameters.
 
     Args:
-        kv_bits: Number of bits for quantization. If None, disables quantization.
+        kv_bits: Number of bits for quantization. None disables quantization.
+                 May be a (key_bits, value_bits) tuple for asymmetric KVSplit.
         kv_group_size: Group size for quantization. Defaults to 64 if quantization enabled.
         quantized_kv_start: Step to begin quantization. Defaults to 0 if quantization enabled.
 
@@ -38,8 +39,13 @@ def get_kv_cache_quantization_params(
     if quantized_kv_start is None:
         quantized_kv_start = 0
 
-    if kv_bits not in VALID_KV_BITS:
-        raise ValueError(f"Invalid kv_bits value. Must be one of {VALID_KV_BITS}")
+    # Asymmetric KVSplit: keys need higher precision, values tolerate lower bits well
+    if isinstance(kv_bits, int):
+        kv_bits = (kv_bits, max(kv_bits // 2, 2))
+
+    for b in kv_bits:
+        if b not in VALID_KV_BITS:
+            raise ValueError(f"Invalid kv_bits value. Must be one of {VALID_KV_BITS}")
     if kv_group_size not in VALID_KV_GROUP_SIZE:
         raise ValueError(
             f"Invalid kv_group_size value. Must be one of {VALID_KV_GROUP_SIZE}"
