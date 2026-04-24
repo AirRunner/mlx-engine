@@ -494,8 +494,6 @@ class CacheWrapper:
             boundary_idx, plugin_name = _find_system_prompt_boundary(
                 token_list, self._tokenizer
             )
-            if boundary_idx is None:
-                boundary_idx = total_prompt_tokens - num_tokens_to_exclude
 
         with mx.stream(generation_stream):
             try:
