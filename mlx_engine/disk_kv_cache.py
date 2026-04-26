@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 BLOCK_SIZE = 2048
 CACHE_DIR = Path.home() / ".cache" / "mlx-engine" / "kv_cache"
-_MAX_CACHE_BYTES = int(os.environ.get("MLX_DISK_KV_CACHE_MAX_GB", "2")) * 1024**3
+_MAX_CACHE_BYTES = int(os.environ.get("MLX_DISK_KV_CACHE_MAX_GB", "5")) * 1024**3
 
 
 def _block_hash(block_tokens: list, prev_hash: bytes) -> bytes:
@@ -152,7 +152,7 @@ class PagedDiskKVCache:
     and the last block's GDN state is used for reconstruction.
 
     Eviction: global LRU weighted by recency * log(1 + hit_count), capped at
-    MLX_DISK_KV_CACHE_MAX_GB (default 2 GB). System-prompt blocks accumulate
+    MLX_DISK_KV_CACHE_MAX_GB (default 5 GB). System-prompt blocks accumulate
     high hit_count and survive eviction; conversation-specific blocks (count=1)
     are evicted first.
     """
