@@ -336,6 +336,7 @@ class CacheWrapper:
                 norm_tokens,
                 self._model_path,
                 kv_bits=self._kv_cache_qtn_params.get("kv_bits"),
+                kv_group_size=self._kv_cache_qtn_params.get("kv_group_size"),
             )
             if result is not None:
                 disk_cache, cached_count = result
@@ -466,7 +467,12 @@ class CacheWrapper:
         if self._disk_store:
             bs = self._disk_store._block_size
             norm_tokens_disk, norm_orig_disk = self._normalize_think_tokens(token_list)
-            hashes = compute_block_hashes(norm_tokens_disk, bs)
+            hashes = compute_block_hashes(
+                norm_tokens_disk,
+                bs,
+                kv_bits=self._kv_cache_qtn_params.get("kv_bits"),
+                kv_group_size=self._kv_cache_qtn_params.get("kv_group_size"),
+            )
             self._disk_save_queue = [
                 (h, norm_orig_disk[i * bs], norm_orig_disk[(i + 1) * bs - 1] + 1)
                 for i, h in enumerate(hashes)

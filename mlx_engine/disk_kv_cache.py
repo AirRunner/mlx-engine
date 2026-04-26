@@ -56,10 +56,36 @@ def _block_hash(block_tokens: list, prev_hash: bytes) -> bytes:
     return h.digest()
 
 
-def compute_block_hashes(token_list: list, block_size: int = BLOCK_SIZE) -> list[bytes]:
-    """Chained SHA-256 hashes for every full block in token_list."""
+def _quant_config_seed(kv_bits, kv_group_size: Optional[int]) -> bytes:
+    """Return a deterministic seed encoding the quantization config.
+
+    Namespaces the hash chain so that blocks saved under different configs
+    (e.g. plain vs. 4-bit vs. asymmetric 8/4-bit) never share a hash key.
+    Returns b'' when quantization is disabled, preserving existing hashes.
+    """
+    if kv_bits is None:
+        return b""
+    h = hashlib.sha256()
+    bits = kv_bits if isinstance(kv_bits, tuple) else (kv_bits, kv_bits)
+    h.update(struct.pack("II", *bits))
+    if kv_group_size is not None:
+        h.update(struct.pack("I", kv_group_size))
+    return h.digest()
+
+
+def compute_block_hashes(
+    token_list: list,
+    block_size: int = BLOCK_SIZE,
+    kv_bits=None,
+    kv_group_size: Optional[int] = None,
+) -> list[bytes]:
+    """Chained SHA-256 hashes for every full block in token_list.
+
+    The chain is seeded by the quantization config so that blocks from
+    different configs are always distinct even for identical token sequences.
+    """
     hashes: list[bytes] = []
-    prev = b""
+    prev = _quant_config_seed(kv_bits, kv_group_size)
     for i in range(len(token_list) // block_size):
         prev = _block_hash(token_list[i * block_size : (i + 1) * block_size], prev)
         hashes.append(prev)
@@ -259,13 +285,16 @@ class PagedDiskKVCache:
         token_list: list,
         model_path: str,
         kv_bits=None,
+        kv_group_size: Optional[int] = None,
     ) -> Optional[tuple]:
         """Walk the block hash chain and restore the longest cached prefix.
 
         Returns (reconstructed_cache, cached_token_count) on hit, None on miss.
         """
         now = time.time()
-        hashes = compute_block_hashes(token_list, self._block_size)
+        hashes = compute_block_hashes(
+            token_list, self._block_size, kv_bits, kv_group_size
+        )
         matches: list[tuple[str, Path]] = []
         for h in hashes:
             key = h.hex()
