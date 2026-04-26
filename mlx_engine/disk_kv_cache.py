@@ -1,0 +1,254 @@
+# Paged disk KV cache for mlx-engine.
+# Per-block slice design adapted from jundot/omlx (Apache 2.0).
+
+import hashlib
+import json
+import logging
+import math
+import os
+import struct
+import time
+from pathlib import Path
+from typing import Optional
+
+import mlx.core as mx
+from mlx_lm.models.cache import (
+    ArraysCache,
+    KVCache,
+    QuantizedKVCache,
+    load_prompt_cache,
+    save_prompt_cache,
+)
+
+logger = logging.getLogger(__name__)
+
+BLOCK_SIZE = 2048
+CACHE_DIR = Path.home() / ".cache" / "mlx-engine" / "kv_cache"
+_MAX_CACHE_BYTES = int(os.environ.get("MLX_DISK_KV_CACHE_MAX_GB", "2")) * 1024**3
+
+
+def _block_hash(block_tokens: list, prev_hash: bytes) -> bytes:
+    h = hashlib.sha256()
+    h.update(prev_hash)
+    h.update(struct.pack(f"{len(block_tokens)}I", *block_tokens))
+    return h.digest()
+
+
+def compute_block_hashes(token_list: list, block_size: int = BLOCK_SIZE) -> list[bytes]:
+    """Chained SHA-256 hashes for every full block in token_list."""
+    hashes: list[bytes] = []
+    prev = b""
+    for i in range(len(token_list) // block_size):
+        prev = _block_hash(token_list[i * block_size : (i + 1) * block_size], prev)
+        hashes.append(prev)
+    return hashes
+
+
+def _slice_cache(cache: list, start: int, end: int) -> list:
+    """Return new cache objects with KV sliced to [start:end] and GDN full state."""
+    result = []
+    for layer in cache:
+        if isinstance(layer, QuantizedKVCache):
+            ks, vs = layer.state
+            new_layer = QuantizedKVCache.__new__(QuantizedKVCache)
+            new_layer.state = (
+                tuple(t[..., start:end, :] for t in ks),
+                tuple(t[..., start:end, :] for t in vs),
+            )
+            new_layer.meta_state = (
+                str(end - start),
+                str(layer.group_size),
+                str(layer.bits),
+            )
+            result.append(new_layer)
+        elif isinstance(layer, KVCache):
+            ks, vs = layer.state
+            new_layer = KVCache.__new__(KVCache)
+            new_layer.state = (ks[..., start:end, :], vs[..., start:end, :])
+            result.append(new_layer)
+        elif isinstance(layer, ArraysCache):
+            new_layer = ArraysCache.__new__(ArraysCache)
+            new_layer.state = list(layer.state)
+            result.append(new_layer)
+        else:
+            result.append(layer)
+    return result
+
+
+def _concatenate_block_caches(block_caches: list) -> list:
+    """Concatenate N per-block cache lists along the sequence axis.
+
+    KV layers are concatenated; ArraysCache (GDN) state comes from the last
+    block, which is the correct cumulative snapshot.
+    """
+    n_layers = len(block_caches[0])
+    result = []
+    for i in range(n_layers):
+        first = block_caches[0][i]
+        if isinstance(first, QuantizedKVCache):
+            all_ks = [bc[i].state[0] for bc in block_caches]
+            all_vs = [bc[i].state[1] for bc in block_caches]
+            n_comp = len(all_ks[0])
+            concat_k = tuple(
+                mx.concatenate([k[j] for k in all_ks], axis=2) for j in range(n_comp)
+            )
+            concat_v = tuple(
+                mx.concatenate([v[j] for v in all_vs], axis=2) for j in range(n_comp)
+            )
+            new_layer = QuantizedKVCache.__new__(QuantizedKVCache)
+            new_layer.state = (concat_k, concat_v)
+            new_layer.meta_state = (
+                str(sum(bc[i].offset for bc in block_caches)),
+                str(first.group_size),
+                str(first.bits),
+            )
+            result.append(new_layer)
+        elif isinstance(first, KVCache):
+            all_ks = [bc[i].state[0] for bc in block_caches]
+            all_vs = [bc[i].state[1] for bc in block_caches]
+            new_layer = KVCache.__new__(KVCache)
+            new_layer.state = (
+                mx.concatenate(all_ks, axis=2),
+                mx.concatenate(all_vs, axis=2),
+            )
+            result.append(new_layer)
+        else:
+            # ArraysCache (GDN) and unknown types: use last block's state
+            result.append(block_caches[-1][i])
+    return result
+
+
+class PagedDiskKVCache:
+    """Paged disk KV cache with per-block safetensors files and chained hashing.
+
+    Each file stores the KV slice for its BLOCK_SIZE-token window plus the full
+    GDN (ArraysCache) state at that boundary. On load, KV slices are concatenated
+    and the last block's GDN state is used for reconstruction.
+
+    Eviction: global LRU weighted by recency * log(1 + hit_count), capped at
+    MLX_DISK_KV_CACHE_MAX_GB (default 5 GB). System-prompt blocks accumulate
+    high hit_count and survive eviction; conversation-specific blocks (count=1)
+    are evicted first.
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path = CACHE_DIR,
+        block_size: int = BLOCK_SIZE,
+    ) -> None:
+        self._cache_dir = cache_dir
+        self._block_size = block_size
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._manifest_path = self._cache_dir / "manifest.json"
+        self._manifest: dict = {}
+        if self._manifest_path.exists():
+            try:
+                with open(self._manifest_path) as f:
+                    self._manifest = json.load(f)
+            except Exception as e:
+                logger.warning(f"[kv-disk] failed to load manifest: {e}")
+
+    def should_save_block(self, block_hash: bytes, model_path: str) -> bool:
+        """Return True if this block is not already on disk for this model."""
+        key = block_hash.hex()
+        entry = self._manifest.get(key)
+        if not entry or entry.get("model_path") != model_path:
+            return True
+        return not (self._cache_dir / f"{key}.safetensors").exists()
+
+    def save_block(
+        self,
+        block_hash: bytes,
+        cache: list,
+        start: int,
+        end: int,
+        model_path: str,
+    ) -> None:
+        """Persist a per-block KV slice + GDN snapshot to disk."""
+        key = block_hash.hex()
+        path = self._cache_dir / f"{key}.safetensors"
+        try:
+            sliced = _slice_cache(cache, start, end)
+            save_prompt_cache(str(path), sliced, metadata={"model_path": model_path})
+        except Exception as e:
+            logger.warning(f"[kv-disk] save failed block=[{start}:{end}]: {e}")
+            return
+        self._manifest[key] = {
+            "model_path": model_path,
+            "file_size": path.stat().st_size,
+            "last_used": time.time(),
+            "hit_count": self._manifest.get(key, {}).get("hit_count", 0),
+        }
+        self._evict_if_needed()
+        self._save_manifest()
+        logger.info(f"[kv-disk] saved block [{start}:{end}] → {key[:8]}…")
+
+    def find_and_load(
+        self,
+        token_list: list,
+        model_path: str,
+    ) -> Optional[tuple]:
+        """Walk the block hash chain and restore the longest cached prefix.
+
+        Returns (reconstructed_cache, cached_token_count) on hit, None on miss.
+        """
+        hashes = compute_block_hashes(token_list, self._block_size)
+        matches: list[tuple[str, Path]] = []
+        for h in hashes:
+            key = h.hex()
+            entry = self._manifest.get(key)
+            if not entry or entry.get("model_path") != model_path:
+                break
+            path = self._cache_dir / f"{key}.safetensors"
+            if not path.exists():
+                logger.warning(f"[kv-disk] manifest entry {key[:8]} missing on disk")
+                del self._manifest[key]
+                self._save_manifest()
+                break
+            matches.append((key, path))
+
+        if not matches:
+            return None
+
+        cached_count = len(matches) * self._block_size
+        try:
+            block_caches = [load_prompt_cache(str(p)) for _, p in matches]
+            cache = _concatenate_block_caches(block_caches)
+        except Exception as e:
+            logger.warning(f"[kv-disk] load failed: {e}")
+            return None
+
+        for key, _ in matches:
+            self._manifest[key]["last_used"] = time.time()
+            self._manifest[key]["hit_count"] = (
+                self._manifest[key].get("hit_count", 0) + 1
+            )
+        self._save_manifest()
+        logger.info(
+            f"[kv-disk] hit: {cached_count}/{len(token_list)} tokens ({len(matches)} blocks)"
+        )
+        return cache, cached_count
+
+    def _evict_if_needed(self) -> None:
+        total = sum(e.get("file_size", 0) for e in self._manifest.values())
+        while total > _MAX_CACHE_BYTES and self._manifest:
+            worst = min(
+                self._manifest,
+                key=lambda k: (
+                    self._manifest[k].get("last_used", 0)
+                    * math.log1p(self._manifest[k].get("hit_count", 0))
+                ),
+            )
+            entry = self._manifest.pop(worst)
+            (self._cache_dir / f"{worst}.safetensors").unlink(missing_ok=True)
+            total -= entry.get("file_size", 0)
+            logger.info(
+                f"[kv-disk] evicted {worst[:8]} ({entry.get('file_size', 0) // 1024**2} MB)"
+            )
+
+    def _save_manifest(self) -> None:
+        try:
+            with open(self._manifest_path, "w") as f:
+                json.dump(self._manifest, f)
+        except Exception as e:
+            logger.warning(f"[kv-disk] failed to write manifest: {e}")

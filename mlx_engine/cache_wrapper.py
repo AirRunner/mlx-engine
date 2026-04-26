@@ -16,6 +16,7 @@ from mlx_lm.models.cache import (
     trim_prompt_cache,
 )
 
+from mlx_engine.disk_kv_cache import PagedDiskKVCache, compute_block_hashes
 from mlx_engine.utils.prompt_progress_reporter import (
     PromptProgressReporter,
     StopPromptProcessing,
@@ -79,6 +80,7 @@ class CacheWrapper:
         checkpoint_tail_tokens: int = DEFAULT_CHECKPOINT_TAIL_TOKENS,
         history_capacity: int = 10,
         tokenizer=None,
+        model_path: str = "",
     ):
         self.model = model
         self._draft_model: Optional[nn.Module] = None
@@ -106,6 +108,11 @@ class CacheWrapper:
         # VisionAddOn is present.
         self._image_store: Optional["ImageCheckpointStore"] = None
         self._tokenizer = tokenizer
+        self._model_path: str = model_path
+        self._disk_store: Optional[PagedDiskKVCache] = (
+            PagedDiskKVCache() if model_path else None
+        )
+        self._disk_save_queue: list[tuple] = []
 
     @property
     def cache(self) -> List[Any]:
@@ -316,6 +323,12 @@ class CacheWrapper:
             self._apply_gdn_snapshot(self._prev_checkpoint.gdn_snapshot, n_to_trim)
             return self._live_cache, prompt_tokens[self._prev_checkpoint.kv_len :]
 
+        if self._disk_store:
+            result = self._disk_store.find_and_load(token_list, self._model_path)
+            if result is not None:
+                disk_cache, cached_count = result
+                return disk_cache, prompt_tokens[cached_count:]
+
         return None, prompt_tokens
 
     def _prefill_cache(
@@ -354,6 +367,17 @@ class CacheWrapper:
             mx.clear_cache()
 
             current_cache_size = self._num_tokens_in_cache(cache)
+
+            if not is_draft and self._disk_save_queue and self._disk_store:
+                remaining = []
+                for h, start, end in self._disk_save_queue:
+                    if current_cache_size is not None and current_cache_size >= end:
+                        self._disk_store.save_block(
+                            h, cache, start, end, self._model_path
+                        )
+                    else:
+                        remaining.append((h, start, end))
+                self._disk_save_queue = remaining
             if (
                 checkpoint_prefix_len is not None
                 and not stored_checkpoint
@@ -419,6 +443,17 @@ class CacheWrapper:
             cached_tokens,
             total_prompt_tokens,
         )
+
+        if self._disk_store:
+            bs = self._disk_store._block_size
+            hashes = compute_block_hashes(token_list, bs)
+            self._disk_save_queue = [
+                (h, i * bs, (i + 1) * bs)
+                for i, h in enumerate(hashes)
+                if self._disk_store.should_save_block(h, self._model_path)
+            ]
+        else:
+            self._disk_save_queue = []
 
         reporter.begin(
             is_draft=False,
