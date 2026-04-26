@@ -526,7 +526,7 @@ class CacheWrapper:
         )
         self._restore_and_insert(cp.gdn_snapshot, cp.lru_key, n_to_trim)
         kv_offset = next(
-            (c.offset for c in self._live_cache if isinstance(c, KVCache)), -1
+            (c.offset for c in self._live_cache if hasattr(c, "offset")), -1
         )
         logger.info(
             f"[kv] finalize done key_len={len(cp.lru_key)} kv_offset={kv_offset}"
