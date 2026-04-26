@@ -62,6 +62,13 @@ def _state_kind(state) -> str:
     return "unknown"
 
 
+def _quant_format_mismatch(cache: list, kv_bits) -> bool:
+    """Return True if the cache's quantization format doesn't match kv_bits."""
+    if kv_bits is not None:
+        return any(hasattr(c, "to_quantized") for c in cache)
+    return any(_state_kind(c.state) == "quantized" for c in cache)
+
+
 def _slice_cache(cache: list, start: int, end: int) -> list:
     """Return new cache objects with KV sliced to [start:end] and GDN full state."""
     result = []
@@ -78,9 +85,7 @@ def _slice_cache(cache: list, start: int, end: int) -> list:
             # Preserve all meta fields (group_size, bits, etc.); update offset only.
             new_layer.meta_state = (str(end - start),) + tuple(layer.meta_state[1:])
         elif kind == "plain" and not hasattr(layer, "meta_state"):
-            # Standard KVCache: sliceable; its state setter sets offset automatically.
-            # Complex rotating variants (RotatingKVCache) have meta_state and fall
-            # through to the else branch below.
+            # RotatingKVCache also has plain state but carries meta_state, so it falls through.
             ks, vs = state
             new_layer = KVCache.__new__(KVCache)
             new_layer.state = (ks[..., start:end, :], vs[..., start:end, :])
@@ -123,8 +128,7 @@ def _concatenate_block_caches(block_caches: list) -> list:
             ) + tuple(block_caches[0][i].meta_state[1:])
             result.append(new_layer)
         elif kind == "plain" and not hasattr(block_caches[0][i], "meta_state"):
-            # Standard KVCache only; RotatingKVCache has meta_state and falls
-            # through to the else branch below.
+            # RotatingKVCache also has plain state but carries meta_state, so it falls through.
             all_ks = [bc[i].state[0] for bc in block_caches]
             all_vs = [bc[i].state[1] for bc in block_caches]
             new_layer = KVCache.__new__(KVCache)
@@ -254,18 +258,16 @@ class PagedDiskKVCache:
 
         cache = _concatenate_block_caches(block_caches)
 
-        # Skip (without deleting) blocks whose quantization format doesn't match the
-        # current config. The blocks remain on disk in case the config is reverted.
-        if kv_bits is not None:
-            if any(hasattr(c, "to_quantized") for c in cache):
-                logger.warning(
-                    "[kv-disk] quantization config changed, skipping stale plain blocks"
-                )
-                return None
-        elif any(_state_kind(c.state) == "quantized" for c in cache):
+        # Skip blocks whose quantization format doesn't match the current config.
+        # Blocks are kept on disk in case the config is reverted, but marked with
+        # last_used=0 so the LRU evicts them first when the cache fills up.
+        if _quant_format_mismatch(cache, kv_bits):
             logger.warning(
-                "[kv-disk] quantization config changed, skipping stale quantized blocks"
+                "[kv-disk] quantization config changed, skipping stale blocks"
             )
+            for key, _ in matches:
+                self._manifest[key]["last_used"] = 0
+            self._save_manifest()
             return None
 
         cached_count = len(matches) * self._block_size
