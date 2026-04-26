@@ -324,7 +324,11 @@ class CacheWrapper:
             return self._live_cache, prompt_tokens[self._prev_checkpoint.kv_len :]
 
         if self._disk_store:
-            result = self._disk_store.find_and_load(token_list, self._model_path)
+            result = self._disk_store.find_and_load(
+                token_list,
+                self._model_path,
+                kv_bits=self._kv_cache_qtn_params.get("kv_bits"),
+            )
             if result is not None:
                 disk_cache, cached_count = result
                 return disk_cache, prompt_tokens[cached_count:]
@@ -369,12 +373,19 @@ class CacheWrapper:
             current_cache_size = self._num_tokens_in_cache(cache)
 
             if not is_draft and self._disk_save_queue and self._disk_store:
+                kv_bits = self._kv_cache_qtn_params.get("kv_bits")
+                cache_fully_quantized = kv_bits is None or not any(
+                    hasattr(c, "to_quantized") for c in cache
+                )
                 remaining = []
                 for h, start, end in self._disk_save_queue:
                     if current_cache_size is not None and current_cache_size >= end:
-                        self._disk_store.save_block(
-                            h, cache, start, end, self._model_path
-                        )
+                        if cache_fully_quantized:
+                            self._disk_store.save_block(
+                                h, cache, start, end, self._model_path
+                            )
+                        else:
+                            remaining.append((h, start, end))
                     else:
                         remaining.append((h, start, end))
                 self._disk_save_queue = remaining

@@ -44,45 +44,69 @@ def compute_block_hashes(token_list: list, block_size: int = BLOCK_SIZE) -> list
     return hashes
 
 
+def _state_kind(state) -> str:
+    """Classify a cache layer's state without relying on class identity.
+
+    Returns 'quantized', 'plain', 'arrays', or 'unknown'.
+    Structure rules:
+      - list                   -> ArraysCache (GDN state)
+      - tuple[tuple, tuple]    -> QuantizedKVCache (packed key/value components)
+      - tuple[mx.array, ...]   -> KVCache (raw key/value tensors)
+    """
+    if isinstance(state, list):
+        return "arrays"
+    if isinstance(state[0], (list, tuple)):
+        return "quantized"
+    if isinstance(state[0], mx.array):
+        return "plain"
+    return "unknown"
+
+
 def _slice_cache(cache: list, start: int, end: int) -> list:
     """Return new cache objects with KV sliced to [start:end] and GDN full state."""
     result = []
     for layer in cache:
-        if isinstance(layer, QuantizedKVCache):
-            ks, vs = layer.state
+        state = layer.state
+        kind = _state_kind(state)
+        if kind == "quantized":
+            ks, vs = state
             new_layer = QuantizedKVCache.__new__(QuantizedKVCache)
             new_layer.state = (
                 tuple(t[..., start:end, :] for t in ks),
                 tuple(t[..., start:end, :] for t in vs),
             )
-            orig = layer.meta_state
-            new_layer.meta_state = (str(end - start), orig[1], orig[2])
-            result.append(new_layer)
-        elif isinstance(layer, KVCache):
-            ks, vs = layer.state
+            # Preserve all meta fields (group_size, bits, etc.); update offset only.
+            new_layer.meta_state = (str(end - start),) + tuple(layer.meta_state[1:])
+        elif kind == "plain" and not hasattr(layer, "meta_state"):
+            # Standard KVCache: sliceable; its state setter sets offset automatically.
+            # Complex rotating variants (RotatingKVCache) have meta_state and fall
+            # through to the else branch below.
+            ks, vs = state
             new_layer = KVCache.__new__(KVCache)
             new_layer.state = (ks[..., start:end, :], vs[..., start:end, :])
-            result.append(new_layer)
-        elif isinstance(layer, ArraysCache):
+        elif kind == "arrays":
+            # ArraysCache (GDN): not sequence-indexed, copy full state as-is.
             new_layer = ArraysCache.__new__(ArraysCache)
-            new_layer.state = list(layer.state)
-            result.append(new_layer)
+            new_layer.state = list(state)
         else:
             result.append(layer)
+            continue
+        result.append(new_layer)
     return result
 
 
 def _concatenate_block_caches(block_caches: list) -> list:
     """Concatenate N per-block cache lists along the sequence axis.
 
-    KV layers are concatenated; ArraysCache (GDN) state comes from the last
+    KV layers are concatenated; GDN (ArraysCache) state comes from the last
     block, which is the correct cumulative snapshot.
     """
     n_layers = len(block_caches[0])
     result = []
     for i in range(n_layers):
-        first = block_caches[0][i]
-        if isinstance(first, QuantizedKVCache):
+        first_state = block_caches[0][i].state
+        kind = _state_kind(first_state)
+        if kind == "quantized":
             all_ks = [bc[i].state[0] for bc in block_caches]
             all_vs = [bc[i].state[1] for bc in block_caches]
             n_comp = len(all_ks[0])
@@ -94,14 +118,13 @@ def _concatenate_block_caches(block_caches: list) -> list:
             )
             new_layer = QuantizedKVCache.__new__(QuantizedKVCache)
             new_layer.state = (concat_k, concat_v)
-            orig = first.meta_state
             new_layer.meta_state = (
                 str(sum(bc[i].offset for bc in block_caches)),
-                orig[1],
-                orig[2],
-            )
+            ) + tuple(block_caches[0][i].meta_state[1:])
             result.append(new_layer)
-        elif isinstance(first, KVCache):
+        elif kind == "plain" and not hasattr(block_caches[0][i], "meta_state"):
+            # Standard KVCache only; RotatingKVCache has meta_state and falls
+            # through to the else branch below.
             all_ks = [bc[i].state[0] for bc in block_caches]
             all_vs = [bc[i].state[1] for bc in block_caches]
             new_layer = KVCache.__new__(KVCache)
@@ -111,7 +134,8 @@ def _concatenate_block_caches(block_caches: list) -> list:
             )
             result.append(new_layer)
         else:
-            # ArraysCache (GDN) and unknown types: use last block's state
+            # ArraysCache (GDN) and pass-through types: last block holds the
+            # correct cumulative state.
             result.append(block_caches[-1][i])
     return result
 
@@ -124,7 +148,7 @@ class PagedDiskKVCache:
     and the last block's GDN state is used for reconstruction.
 
     Eviction: global LRU weighted by recency * log(1 + hit_count), capped at
-    MLX_DISK_KV_CACHE_MAX_GB (default 5 GB). System-prompt blocks accumulate
+    MLX_DISK_KV_CACHE_MAX_GB (default 2 GB). System-prompt blocks accumulate
     high hit_count and survive eviction; conversation-specific blocks (count=1)
     are evicted first.
     """
@@ -185,6 +209,7 @@ class PagedDiskKVCache:
         self,
         token_list: list,
         model_path: str,
+        kv_bits=None,
     ) -> Optional[tuple]:
         """Walk the block hash chain and restore the longest cached prefix.
 
@@ -208,14 +233,42 @@ class PagedDiskKVCache:
         if not matches:
             return None
 
-        cached_count = len(matches) * self._block_size
         try:
             block_caches = [load_prompt_cache(str(p)) for _, p in matches]
-            cache = _concatenate_block_caches(block_caches)
         except Exception as e:
             logger.warning(f"[kv-disk] load failed: {e}")
             return None
 
+        # Validate that all blocks have the same type per layer before concatenating.
+        # A mismatch indicates stale files saved under a different quantization config.
+        n_layers = len(block_caches[0])
+        for i in range(n_layers):
+            kind = _state_kind(block_caches[0][i].state)
+            if any(_state_kind(bc[i].state) != kind for bc in block_caches[1:]):
+                logger.warning("[kv-disk] stale blocks invalidated (mixed types)")
+                for key, path in matches:
+                    self._manifest.pop(key, None)
+                    path.unlink(missing_ok=True)
+                self._save_manifest()
+                return None
+
+        cache = _concatenate_block_caches(block_caches)
+
+        # Skip (without deleting) blocks whose quantization format doesn't match the
+        # current config. The blocks remain on disk in case the config is reverted.
+        if kv_bits is not None:
+            if any(hasattr(c, "to_quantized") for c in cache):
+                logger.warning(
+                    "[kv-disk] quantization config changed, skipping stale plain blocks"
+                )
+                return None
+        elif any(_state_kind(c.state) == "quantized" for c in cache):
+            logger.warning(
+                "[kv-disk] quantization config changed, skipping stale quantized blocks"
+            )
+            return None
+
+        cached_count = len(matches) * self._block_size
         for key, _ in matches:
             self._manifest[key]["last_used"] = time.time()
             self._manifest[key]["hit_count"] = (
@@ -223,7 +276,8 @@ class PagedDiskKVCache:
             )
         self._save_manifest()
         logger.info(
-            f"[kv-disk] hit: {cached_count}/{len(token_list)} tokens ({len(matches)} blocks)"
+            f"[kv-disk] hit: {cached_count}/{len(token_list)} tokens"
+            f" ({len(matches)} blocks)"
         )
         return cache, cached_count
 
