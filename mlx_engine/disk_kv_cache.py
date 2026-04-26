@@ -55,11 +55,8 @@ def _slice_cache(cache: list, start: int, end: int) -> list:
                 tuple(t[..., start:end, :] for t in ks),
                 tuple(t[..., start:end, :] for t in vs),
             )
-            new_layer.meta_state = (
-                str(end - start),
-                str(layer.group_size),
-                str(layer.bits),
-            )
+            orig = layer.meta_state
+            new_layer.meta_state = (str(end - start), orig[1], orig[2])
             result.append(new_layer)
         elif isinstance(layer, KVCache):
             ks, vs = layer.state
@@ -97,10 +94,11 @@ def _concatenate_block_caches(block_caches: list) -> list:
             )
             new_layer = QuantizedKVCache.__new__(QuantizedKVCache)
             new_layer.state = (concat_k, concat_v)
+            orig = first.meta_state
             new_layer.meta_state = (
                 str(sum(bc[i].offset for bc in block_caches)),
-                str(first.group_size),
-                str(first.bits),
+                orig[1],
+                orig[2],
             )
             result.append(new_layer)
         elif isinstance(first, KVCache):
