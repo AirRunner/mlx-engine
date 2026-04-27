@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import statistics
 import struct
 import time
 from pathlib import Path
@@ -151,10 +152,9 @@ class PagedDiskKVCache:
     GDN (ArraysCache) state at that boundary. On load, KV slices are concatenated
     and the last block's GDN state is used for reconstruction.
 
-    Eviction: global LRU weighted by recency * log(1 + hit_count), capped at
-    MLX_DISK_KV_CACHE_MAX_GB (default 5 GB). System-prompt blocks accumulate
-    high hit_count and survive eviction; conversation-specific blocks (count=1)
-    are evicted first.
+    Eviction: score = hit_count * exp(-age / tau), where tau is the mean idle
+    time across all manifest entries. Adapts to actual usage frequency with no
+    fixed time constant. Capped at MLX_DISK_KV_CACHE_MAX_GB (default 5 GB).
     """
 
     def __init__(
@@ -309,15 +309,29 @@ class PagedDiskKVCache:
         if self._increment_hit_counts(keys):
             self._save_manifest()
 
+    def _evict_score(self, entry: dict, now: float, tau: float) -> float:
+        """Eviction score: higher = keep longer.
+
+        hit_count * exp(-age / tau), where tau is the mean idle time across
+        all manifest entries. Adapts to actual usage frequency with no fixed
+        time constant. Blocks with hit_count=0 always score 0.
+        """
+        age = max(now - entry.get("last_used", now), 1.0)
+        return entry.get("hit_count", 0.0) * math.exp(-age / tau)
+
     def _evict_if_needed(self) -> None:
         total = sum(e.get("file_size", 0) for e in self._manifest.values())
+        if total <= _MAX_CACHE_BYTES:
+            return
+        now = time.time()
+        ages = [
+            max(now - e.get("last_used", now), 1.0) for e in self._manifest.values()
+        ]
+        tau = statistics.fmean(ages)
         while total > _MAX_CACHE_BYTES and self._manifest:
             worst = min(
                 self._manifest,
-                key=lambda k: (
-                    self._manifest[k].get("last_used", 0)
-                    * math.log1p(self._manifest[k].get("hit_count", 0))
-                ),
+                key=lambda k: self._evict_score(self._manifest[k], now, tau),
             )
             entry = self._manifest.pop(worst)
             (self._cache_dir / f"{worst}.safetensors").unlink(missing_ok=True)
