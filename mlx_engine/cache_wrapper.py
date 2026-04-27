@@ -253,6 +253,10 @@ class CacheWrapper:
                         return i + prefix_len
         return self._checkpoint_tail_tokens
 
+    def _record_lru_hit(self, token_list: list, cached_token_count: int) -> None:
+        if self._disk_store:
+            self._disk_store.record_lru_hit(token_list, cached_token_count)
+
     def _restore_cache(
         self,
         prompt_tokens: mx.array,
@@ -276,10 +280,12 @@ class CacheWrapper:
                 else len(token_list)
             )
             if start < len(token_list):
+                self._record_lru_hit(token_list, start)
                 return cache, prompt_tokens[start:]
 
             # Exact hit: try to trim 1 token to seed decode.
             if can_trim_prompt_cache(cache) and trim_prompt_cache(cache, 1) == 1:
+                self._record_lru_hit(token_list, len(token_list) - 1)
                 return cache, prompt_tokens[-1:]
 
         if len(prompt_tokens) <= 1:
@@ -300,6 +306,7 @@ class CacheWrapper:
                 if cached_norm < len(truncated_orig)
                 else len(token_list) - 1
             )
+            self._record_lru_hit(token_list, start)
             return cache, prompt_tokens[start:]
 
         # Prev-checkpoint fallback: if LRU missed but the current prompt
@@ -321,6 +328,7 @@ class CacheWrapper:
                 else 0
             )
             self._apply_gdn_snapshot(self._prev_checkpoint.gdn_snapshot, n_to_trim)
+            self._record_lru_hit(token_list, self._prev_checkpoint.kv_len)
             return self._live_cache, prompt_tokens[self._prev_checkpoint.kv_len :]
 
         if self._disk_store:

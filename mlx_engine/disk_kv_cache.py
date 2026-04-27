@@ -271,17 +271,43 @@ class PagedDiskKVCache:
             return None
 
         cached_count = len(matches) * self._block_size
-        for key, _ in matches:
-            self._manifest[key]["last_used"] = time.time()
-            self._manifest[key]["hit_count"] = (
-                self._manifest[key].get("hit_count", 0) + 1
-            )
+        keys = [key for key, _ in matches]
+        now = time.time()
+        for key in keys:
+            self._manifest[key]["last_used"] = now
+        self._increment_hit_counts(keys)
         self._save_manifest()
         logger.info(
             f"[kv-disk] hit: {cached_count}/{len(token_list)} tokens"
             f" ({len(matches)} blocks)"
         )
         return cache, cached_count
+
+    def _increment_hit_counts(self, keys: list[str]) -> bool:
+        """Positional decay: block 0 gets weight n/total, total sums to 1.0. Returns True if any entry updated."""
+        n = len(keys)
+        if n == 0:
+            return False
+        total_weight = n * (n + 1) / 2
+        changed = False
+        for i, key in enumerate(keys):
+            entry = self._manifest.get(key)
+            if entry is not None:
+                entry["hit_count"] = (
+                    entry.get("hit_count", 0.0) + (n - i) / total_weight
+                )
+                changed = True
+        return changed
+
+    def record_lru_hit(self, token_list: list, cached_token_count: int) -> None:
+        """Update manifest hit_count for LRU-served blocks, without touching last_used."""
+        n = cached_token_count // self._block_size
+        if n == 0:
+            return
+        hashes = compute_block_hashes(token_list, self._block_size)
+        keys = [h.hex() for h in hashes[:n]]
+        if self._increment_hit_counts(keys):
+            self._save_manifest()
 
     def _evict_if_needed(self) -> None:
         total = sum(e.get("file_size", 0) for e in self._manifest.values())
