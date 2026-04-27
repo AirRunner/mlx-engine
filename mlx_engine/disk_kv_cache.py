@@ -373,12 +373,20 @@ class PagedDiskKVCache:
                 changed = True
         return changed
 
-    def record_lru_hit(self, token_list: list, cached_token_count: int) -> None:
+    def record_lru_hit(
+        self,
+        token_list: list,
+        cached_token_count: int,
+        kv_bits=None,
+        kv_group_size: Optional[int] = None,
+    ) -> None:
         """Increment hit_count for LRU-served blocks. Does not update last_used."""
         n = cached_token_count // self._block_size
         if n == 0:
             return
-        hashes = compute_block_hashes(token_list, self._block_size)
+        hashes = compute_block_hashes(
+            token_list, self._block_size, kv_bits, kv_group_size
+        )
         keys = [h.hex() for h in hashes[:n]]
         if self._increment_hit_counts(keys):
             self._save_manifest()

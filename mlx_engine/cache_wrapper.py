@@ -255,7 +255,12 @@ class CacheWrapper:
 
     def _record_lru_hit(self, token_list: list, cached_token_count: int) -> None:
         if self._disk_store:
-            self._disk_store.record_lru_hit(token_list, cached_token_count)
+            self._disk_store.record_lru_hit(
+                token_list,
+                cached_token_count,
+                kv_bits=self._kv_cache_qtn_params.get("kv_bits"),
+                kv_group_size=self._kv_cache_qtn_params.get("kv_group_size"),
+            )
 
     def _restore_cache(
         self,
