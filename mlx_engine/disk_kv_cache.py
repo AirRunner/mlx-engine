@@ -193,6 +193,27 @@ class PagedDiskKVCache:
         """Persist a per-block KV slice + GDN snapshot to disk."""
         key = block_hash.hex()
         path = self._cache_dir / f"{key}.safetensors"
+
+        # A new block (hit_count=0, score=0) is the unique eviction target when all
+        # existing blocks are proven. Skip the I/O in that case.
+        total = 0
+        same_model_size = 0
+        same_model_count = 0
+        all_proven = True
+        for e in self._manifest.values():
+            if e.get("hit_count", 0.0) <= 0:
+                all_proven = False
+                break
+            size = e.get("file_size", 0)
+            total += size
+            if e.get("model_path") == model_path:
+                same_model_size += size
+                same_model_count += 1
+        if all_proven and same_model_count > 0:
+            if total + same_model_size / same_model_count > _MAX_CACHE_BYTES:
+                logger.info(f"[kv-disk] skipping block [{start}:{end}]: cache full")
+                return
+
         try:
             sliced = _slice_cache(cache, start, end)
             save_prompt_cache(str(path), sliced, metadata={"model_path": model_path})
