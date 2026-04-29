@@ -882,6 +882,10 @@ def _sequential_generation(
             model_kit, draft_model, num_draft_tokens, generate_args
         )
 
+        # Enable native MTP when the model has an MTP head and no draft model is active
+        if getattr(model_kit, "mtp", False) and draft_model is None:
+            generate_args["mtp"] = True
+
         # Process prompt
         image_store = _get_image_store(model_kit)
         image_cache_prefill_done = False
