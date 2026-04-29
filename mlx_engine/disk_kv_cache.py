@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import os
-import statistics
 import struct
 import time
 from pathlib import Path
@@ -26,6 +25,26 @@ logger = logging.getLogger(__name__)
 BLOCK_SIZE = 2048
 CACHE_DIR = Path.home() / ".cache" / "mlx-engine" / "kv_cache"
 _MAX_CACHE_BYTES = int(os.environ.get("MLX_DISK_KV_CACHE_MAX_GB", "5")) * 1024**3
+_INITIAL_HIT_COUNT = 1
+
+
+def _load_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"[kv-disk] failed to load {path.name}: {e}")
+        return default
+
+
+def _save_json(path: Path, data) -> None:
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.warning(f"[kv-disk] failed to write {path.name}: {e}")
 
 
 def _block_hash(block_tokens: list, prev_hash: bytes) -> bytes:
@@ -152,9 +171,10 @@ class PagedDiskKVCache:
     GDN (ArraysCache) state at that boundary. On load, KV slices are concatenated
     and the last block's GDN state is used for reconstruction.
 
-    Eviction: score = hit_count * exp(-age / tau), where tau is the mean idle
-    time across all manifest entries. Adapts to actual usage frequency with no
-    fixed time constant. Capped at MLX_DISK_KV_CACHE_MAX_GB (default 5 GB).
+    Eviction: score = hit_count * exp(-age / tau), where tau is a running average
+    of inter-session gaps, measured once per process lifetime on the first
+    find_and_load call and persisted in session_tau.json. Capped at
+    MLX_DISK_KV_CACHE_MAX_GB (default 5 GB).
     """
 
     def __init__(
@@ -166,13 +186,12 @@ class PagedDiskKVCache:
         self._block_size = block_size
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._manifest_path = self._cache_dir / "manifest.json"
-        self._manifest: dict = {}
-        if self._manifest_path.exists():
-            try:
-                with open(self._manifest_path) as f:
-                    self._manifest = json.load(f)
-            except Exception as e:
-                logger.warning(f"[kv-disk] failed to load manifest: {e}")
+        self._manifest: dict = _load_json(self._manifest_path, {})
+        self._tau_path = self._cache_dir / "session_tau.json"
+        tau_data = _load_json(self._tau_path, {})
+        self._tau: Optional[float] = tau_data.get("tau")
+        self._tau_weight: int = tau_data.get("weight", 0)
+        self._tau_updated = False
 
     def should_save_block(self, block_hash: bytes, model_path: str) -> bool:
         """Return True if this block is not already on disk for this model."""
@@ -194,25 +213,11 @@ class PagedDiskKVCache:
         key = block_hash.hex()
         path = self._cache_dir / f"{key}.safetensors"
 
-        # A new block (hit_count=0, score=0) is the unique eviction target when all
-        # existing blocks are proven. Skip the I/O in that case.
-        total = 0
-        same_model_size = 0
-        same_model_count = 0
-        all_proven = True
-        for e in self._manifest.values():
-            if e.get("hit_count", 0.0) <= 0:
-                all_proven = False
-                break
-            size = e.get("file_size", 0)
-            total += size
-            if e.get("model_path") == model_path:
-                same_model_size += size
-                same_model_count += 1
-        if all_proven and same_model_count > 0:
-            if total + same_model_size / same_model_count > _MAX_CACHE_BYTES:
-                logger.info(f"[kv-disk] skipping block [{start}:{end}]: cache full")
-                return
+        if key not in self._manifest and self._is_eviction_candidate(key, model_path):
+            logger.info(
+                f"[kv-disk] skipping block [{start}:{end}]: would be immediately evicted"
+            )
+            return
 
         try:
             sliced = _slice_cache(cache, start, end)
@@ -224,7 +229,9 @@ class PagedDiskKVCache:
             "model_path": model_path,
             "file_size": path.stat().st_size,
             "last_used": time.time(),
-            "hit_count": self._manifest.get(key, {}).get("hit_count", 0),
+            "hit_count": self._manifest.get(key, {}).get(
+                "hit_count", _INITIAL_HIT_COUNT
+            ),
         }
         self._evict_if_needed()
         self._save_manifest()
@@ -240,6 +247,8 @@ class PagedDiskKVCache:
 
         Returns (reconstructed_cache, cached_token_count) on hit, None on miss.
         """
+        now = time.time()
+        self._maybe_update_tau(now)
         hashes = compute_block_hashes(token_list, self._block_size)
         matches: list[tuple[str, Path]] = []
         for h in hashes:
@@ -281,7 +290,7 @@ class PagedDiskKVCache:
 
         # Skip blocks whose quantization format doesn't match the current config.
         # Blocks are kept on disk in case the config is reverted, but marked with
-        # last_used=0 so the LRU evicts them first when the cache fills up.
+        # last_used=0 so they are evicted first when the cache fills up.
         if _quant_format_mismatch(cache, kv_bits):
             logger.warning(
                 "[kv-disk] quantization config changed, skipping stale blocks"
@@ -293,7 +302,6 @@ class PagedDiskKVCache:
 
         cached_count = len(matches) * self._block_size
         keys = [key for key, _ in matches]
-        now = time.time()
         for key in keys:
             self._manifest[key]["last_used"] = now
         self._increment_hit_counts(keys)
@@ -305,7 +313,7 @@ class PagedDiskKVCache:
         return cache, cached_count
 
     def _increment_hit_counts(self, keys: list[str]) -> bool:
-        """Positional decay: block 0 gets weight n/total, total sums to 1.0. Returns True if any entry updated."""
+        """Positional decay: weight(i) = (n-i) / (n*(n+1)/2), sums to 1.0 per call."""
         n = len(keys)
         if n == 0:
             return False
@@ -315,13 +323,13 @@ class PagedDiskKVCache:
             entry = self._manifest.get(key)
             if entry is not None:
                 entry["hit_count"] = (
-                    entry.get("hit_count", 0.0) + (n - i) / total_weight
+                    entry.get("hit_count", _INITIAL_HIT_COUNT) + (n - i) / total_weight
                 )
                 changed = True
         return changed
 
     def record_lru_hit(self, token_list: list, cached_token_count: int) -> None:
-        """Update manifest hit_count for LRU-served blocks, without touching last_used."""
+        """Increment hit_count for LRU-served blocks. Does not update last_used."""
         n = cached_token_count // self._block_size
         if n == 0:
             return
@@ -330,26 +338,78 @@ class PagedDiskKVCache:
         if self._increment_hit_counts(keys):
             self._save_manifest()
 
-    def _evict_score(self, entry: dict, now: float, tau: float) -> float:
-        """Eviction score: higher = keep longer.
+    def _maybe_update_tau(self, now: float) -> None:
+        """Measure the inter-session gap and update the stored tau (once per process)."""
+        if self._tau_updated or not self._manifest:
+            return
+        self._tau_updated = True
+        max_last = max(e.get("last_used", 0) for e in self._manifest.values())
+        if max_last <= 0:
+            return
+        # Floor at 1h: technical guard for restarts that happen seconds after last use.
+        gap = max(now - max_last, 3600.0)
+        if self._tau is None:
+            self._tau = gap
+            self._tau_weight = 1
+        else:
+            self._tau = (self._tau * self._tau_weight + gap) / (self._tau_weight + 1)
+            self._tau_weight += 1
+        self._save_tau()
+        logger.debug(
+            f"[kv-disk] tau updated: {self._tau / 3600:.1f}h (weight={self._tau_weight})"
+        )
 
-        hit_count * exp(-age / tau), where tau is the mean idle time across
-        all manifest entries. Adapts to actual usage frequency with no fixed
-        time constant. Blocks with hit_count=0 always score 0.
-        """
+    def _save_tau(self) -> None:
+        _save_json(self._tau_path, {"tau": self._tau, "weight": self._tau_weight})
+
+    def _compute_tau(self, now: float) -> float:
+        if self._tau is not None:
+            return self._tau
+        # Bootstrap: no stored tau yet (first ever session). Arithmetic mean of ages.
+        ages = [
+            max(now - e.get("last_used", now), 1.0) for e in self._manifest.values()
+        ]
+        return sum(ages) / len(ages) if ages else 1.0
+
+    def _evict_score(self, entry: dict, now: float, tau: float) -> float:
         age = max(now - entry.get("last_used", now), 1.0)
-        return entry.get("hit_count", 0.0) * math.exp(-age / tau)
+        return entry.get("hit_count", _INITIAL_HIT_COUNT) * math.exp(-age / tau)
+
+    def _is_eviction_candidate(self, key: str, model_path: str) -> bool:
+        """Return True if a new block would be immediately evicted after writing."""
+        total = same_model_total = same_model_count = 0
+        for e in self._manifest.values():
+            size = e.get("file_size", 0)
+            total += size
+            if e.get("model_path") == model_path:
+                same_model_total += size
+                same_model_count += 1
+        if not same_model_count:
+            return False
+        avg_size = same_model_total // same_model_count
+        if total + avg_size <= _MAX_CACHE_BYTES:
+            return False
+        now = time.time()
+        tau = self._compute_tau(now)
+        # Dry-run: add the candidate with hit=1 and find the worst-scoring entry.
+        test = {
+            **self._manifest,
+            key: {
+                "file_size": avg_size,
+                "last_used": now,
+                "hit_count": _INITIAL_HIT_COUNT,
+            },
+        }
+        worst = min(test, key=lambda k: self._evict_score(test[k], now, tau))
+        return worst == key
 
     def _evict_if_needed(self) -> None:
         total = sum(e.get("file_size", 0) for e in self._manifest.values())
         if total <= _MAX_CACHE_BYTES:
             return
         now = time.time()
-        ages = [
-            max(now - e.get("last_used", now), 1.0) for e in self._manifest.values()
-        ]
-        tau = statistics.fmean(ages)
         while total > _MAX_CACHE_BYTES and self._manifest:
+            tau = self._compute_tau(now)
             worst = min(
                 self._manifest,
                 key=lambda k: self._evict_score(self._manifest[k], now, tau),
@@ -362,8 +422,4 @@ class PagedDiskKVCache:
             )
 
     def _save_manifest(self) -> None:
-        try:
-            with open(self._manifest_path, "w") as f:
-                json.dump(self._manifest, f)
-        except Exception as e:
-            logger.warning(f"[kv-disk] failed to write manifest: {e}")
+        _save_json(self._manifest_path, self._manifest)

@@ -352,3 +352,99 @@ class TestHitCountDecay(unittest.TestCase):
             dkvc._MAX_CACHE_BYTES = original
         self.assertIn("active", self.store._manifest)
         self.assertNotIn("stale_sysprompt", self.store._manifest)
+
+
+class TestSessionTau(unittest.TestCase):
+    """Unit tests for _maybe_update_tau, _compute_tau, and tau persistence."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.store = PagedDiskKVCache(
+            cache_dir=Path(self._tmpdir.name), block_size=TEST_BLOCK_SIZE
+        )
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _inject(self, key: str, age: float, hit_count: float = 1.0):
+        self.store._manifest[key] = {
+            "model_path": "m",
+            "file_size": 100,
+            "last_used": time.time() - age,
+            "hit_count": hit_count,
+        }
+
+    def test_empty_manifest_skips_update(self):
+        now = time.time()
+        self.store._maybe_update_tau(now)
+        self.assertIsNone(self.store._tau)
+        # Empty manifest does not consume the once-per-session slot.
+        self.assertFalse(self.store._tau_updated)
+
+    def test_sets_tau_from_gap(self):
+        self._inject("k", age=7 * 3600.0)
+        now = time.time()
+        self.store._maybe_update_tau(now)
+        self.assertAlmostEqual(self.store._tau, 7 * 3600.0, delta=1.0)
+        self.assertEqual(self.store._tau_weight, 1)
+
+    def test_floor_applied_for_short_gap(self):
+        self._inject("k", age=60.0)
+        now = time.time()
+        self.store._maybe_update_tau(now)
+        self.assertEqual(self.store._tau, 3600.0)
+
+    def test_idempotent_within_session(self):
+        self._inject("k", age=8 * 3600.0)
+        now = time.time()
+        self.store._maybe_update_tau(now)
+        first_tau = self.store._tau
+        self.store._manifest["k"]["last_used"] = now - 100
+        self.store._maybe_update_tau(now)
+        self.assertEqual(self.store._tau, first_tau)
+
+    def test_running_average_with_prior_tau(self):
+        self.store._tau = 8 * 3600.0
+        self.store._tau_weight = 4
+        self._inject("k", age=12 * 3600.0)
+        now = time.time()
+        self.store._maybe_update_tau(now)
+        self.assertAlmostEqual(
+            self.store._tau, (8 * 3600.0 * 4 + 12 * 3600.0) / 5, delta=1.0
+        )
+        self.assertEqual(self.store._tau_weight, 5)
+
+    def test_zero_last_used_sentinel_skips_update(self):
+        """Entries with last_used=0 (quant mismatch sentinel) must not influence tau."""
+        self.store._manifest["k"] = {
+            "model_path": "m",
+            "file_size": 100,
+            "last_used": 0,
+            "hit_count": 1.0,
+        }
+        now = time.time()
+        self.store._maybe_update_tau(now)
+        self.assertIsNone(self.store._tau)
+        self.assertTrue(self.store._tau_updated)
+
+    def test_compute_tau_returns_stored(self):
+        self.store._tau = 6 * 3600.0
+        self.assertAlmostEqual(self.store._compute_tau(time.time()), 6 * 3600.0)
+
+    def test_compute_tau_bootstrap_fmean(self):
+        """Without stored tau, _compute_tau returns arithmetic mean of ages."""
+        self._inject("a", age=3600.0)
+        self._inject("b", age=7200.0)
+        now = time.time()
+        self.assertAlmostEqual(self.store._compute_tau(now), 5400.0, delta=1.0)
+
+    def test_tau_reloaded_on_new_instance(self):
+        self._inject("k", age=5 * 3600.0)
+        now = time.time()
+        self.store._maybe_update_tau(now)
+        store2 = PagedDiskKVCache(
+            cache_dir=self.store._cache_dir, block_size=TEST_BLOCK_SIZE
+        )
+        self.assertAlmostEqual(store2._tau, 5 * 3600.0, delta=1.0)
+        self.assertEqual(store2._tau_weight, 1)
+        self.assertFalse(store2._tau_updated)
