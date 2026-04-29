@@ -26,6 +26,7 @@ BLOCK_SIZE = 2048
 CACHE_DIR = Path.home() / ".cache" / "mlx-engine" / "kv_cache"
 _MAX_CACHE_BYTES = int(os.environ.get("MLX_DISK_KV_CACHE_MAX_GB", "5")) * 1024**3
 _INITIAL_HIT_COUNT = 1
+_TAU_WINDOW = 100
 
 
 def _load_json(path: Path, default):
@@ -171,10 +172,10 @@ class PagedDiskKVCache:
     GDN (ArraysCache) state at that boundary. On load, KV slices are concatenated
     and the last block's GDN state is used for reconstruction.
 
-    Eviction: score = hit_count * exp(-age / tau), where tau is a running average
-    of inter-session gaps, measured once per process lifetime on the first
-    find_and_load call and persisted in session_tau.json. Capped at
-    MLX_DISK_KV_CACHE_MAX_GB (default 5 GB).
+    Eviction: score = hit_count * exp(-age / tau), where tau is a sliding-window
+    average of inter-session gaps (window=_TAU_WINDOW), updated once per process
+    lifetime on the first find_and_load call and persisted in session_tau.json.
+    Capped at MLX_DISK_KV_CACHE_MAX_GB (default 5 GB).
     """
 
     def __init__(
@@ -189,8 +190,10 @@ class PagedDiskKVCache:
         self._manifest: dict = _load_json(self._manifest_path, {})
         self._tau_path = self._cache_dir / "session_tau.json"
         tau_data = _load_json(self._tau_path, {})
-        self._tau: Optional[float] = tau_data.get("tau")
-        self._tau_weight: int = tau_data.get("weight", 0)
+        self._tau_gaps: list[float] = tau_data.get("gaps", [])
+        self._tau: Optional[float] = (
+            sum(self._tau_gaps) / len(self._tau_gaps) if self._tau_gaps else None
+        )
         self._tau_updated = False
 
     def should_save_block(self, block_hash: bytes, model_path: str) -> bool:
@@ -348,19 +351,17 @@ class PagedDiskKVCache:
             return
         # Floor at 1h: technical guard for restarts that happen seconds after last use.
         gap = max(now - max_last, 3600.0)
-        if self._tau is None:
-            self._tau = gap
-            self._tau_weight = 1
-        else:
-            self._tau = (self._tau * self._tau_weight + gap) / (self._tau_weight + 1)
-            self._tau_weight += 1
+        self._tau_gaps.append(gap)
+        if len(self._tau_gaps) > _TAU_WINDOW:
+            self._tau_gaps.pop(0)
+        self._tau = sum(self._tau_gaps) / len(self._tau_gaps)
         self._save_tau()
         logger.debug(
-            f"[kv-disk] tau updated: {self._tau / 3600:.1f}h (weight={self._tau_weight})"
+            f"[kv-disk] tau updated: {self._tau / 3600:.1f}h (n={len(self._tau_gaps)})"
         )
 
     def _save_tau(self) -> None:
-        _save_json(self._tau_path, {"tau": self._tau, "weight": self._tau_weight})
+        _save_json(self._tau_path, {"gaps": self._tau_gaps})
 
     def _compute_tau(self, now: float) -> float:
         if self._tau is not None:

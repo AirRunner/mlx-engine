@@ -386,7 +386,7 @@ class TestSessionTau(unittest.TestCase):
         now = time.time()
         self.store._maybe_update_tau(now)
         self.assertAlmostEqual(self.store._tau, 7 * 3600.0, delta=1.0)
-        self.assertEqual(self.store._tau_weight, 1)
+        self.assertEqual(len(self.store._tau_gaps), 1)
 
     def test_floor_applied_for_short_gap(self):
         self._inject("k", age=60.0)
@@ -403,16 +403,15 @@ class TestSessionTau(unittest.TestCase):
         self.store._maybe_update_tau(now)
         self.assertEqual(self.store._tau, first_tau)
 
-    def test_running_average_with_prior_tau(self):
-        self.store._tau = 8 * 3600.0
-        self.store._tau_weight = 4
+    def test_sliding_window_with_prior_gaps(self):
+        self.store._tau_gaps = [8 * 3600.0] * 4
         self._inject("k", age=12 * 3600.0)
         now = time.time()
         self.store._maybe_update_tau(now)
         self.assertAlmostEqual(
             self.store._tau, (8 * 3600.0 * 4 + 12 * 3600.0) / 5, delta=1.0
         )
-        self.assertEqual(self.store._tau_weight, 5)
+        self.assertEqual(len(self.store._tau_gaps), 5)
 
     def test_zero_last_used_sentinel_skips_update(self):
         """Entries with last_used=0 (quant mismatch sentinel) must not influence tau."""
@@ -446,5 +445,5 @@ class TestSessionTau(unittest.TestCase):
             cache_dir=self.store._cache_dir, block_size=TEST_BLOCK_SIZE
         )
         self.assertAlmostEqual(store2._tau, 5 * 3600.0, delta=1.0)
-        self.assertEqual(store2._tau_weight, 1)
+        self.assertEqual(len(store2._tau_gaps), 1)
         self.assertFalse(store2._tau_updated)
