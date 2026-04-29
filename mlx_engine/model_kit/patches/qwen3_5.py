@@ -73,11 +73,14 @@ class PatchedDecoderLayer(DecoderLayer):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
+        n_confirmed: int = 0,
     ) -> mx.array:
         if self.is_linear:
             if position_ids is None:
                 # Text-only: use original mlx-lm GatedDeltaNet
-                r = self.linear_attn(self.input_layernorm(x), mask, cache)
+                r = self.linear_attn(
+                    self.input_layernorm(x), mask, cache, n_confirmed=n_confirmed
+                )
             else:
                 # Vision: use mlx-vlm GatedDeltaNet computation path
                 r = self._vlm_gated_delta_net(self.input_layernorm(x), mask, cache)
@@ -261,6 +264,7 @@ class PatchedQwen3_5TextModel(Qwen3_5TextModel):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        n_confirmed: int = 0,
     ) -> mx.array:
         if input_embeddings is not None:
             hidden_states = input_embeddings
@@ -278,7 +282,11 @@ class PatchedQwen3_5TextModel(Qwen3_5TextModel):
         for layer, layer_cache in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(
-                hidden_states, mask=mask, cache=layer_cache, position_ids=position_ids
+                hidden_states,
+                mask=mask,
+                cache=layer_cache,
+                position_ids=position_ids,
+                n_confirmed=n_confirmed,
             )
 
         return hidden_states
