@@ -173,8 +173,8 @@ class PagedDiskKVCache:
     and the last block's GDN state is used for reconstruction.
 
     Eviction: score = hit_count * exp(-age / tau), where tau is a sliding-window
-    average of inter-session gaps (window=_TAU_WINDOW), updated once per process
-    lifetime on the first find_and_load call and persisted in session_tau.json.
+    average of inter-session gaps (window=_TAU_WINDOW), measured at startup and
+    persisted in session_tau.json.
     Capped at MLX_DISK_KV_CACHE_MAX_GB (default 5 GB).
     """
 
@@ -194,7 +194,7 @@ class PagedDiskKVCache:
         self._tau: Optional[float] = (
             sum(self._tau_gaps) / len(self._tau_gaps) if self._tau_gaps else None
         )
-        self._tau_updated = False
+        self._maybe_update_tau(time.time())
 
     def should_save_block(self, block_hash: bytes, model_path: str) -> bool:
         """Return True if this block is not already on disk for this model."""
@@ -251,7 +251,6 @@ class PagedDiskKVCache:
         Returns (reconstructed_cache, cached_token_count) on hit, None on miss.
         """
         now = time.time()
-        self._maybe_update_tau(now)
         hashes = compute_block_hashes(token_list, self._block_size)
         matches: list[tuple[str, Path]] = []
         for h in hashes:
@@ -342,10 +341,9 @@ class PagedDiskKVCache:
             self._save_manifest()
 
     def _maybe_update_tau(self, now: float) -> None:
-        """Measure the inter-session gap and update the stored tau (once per process)."""
-        if self._tau_updated or not self._manifest:
+        """Measure the inter-session gap and update the stored tau."""
+        if not self._manifest:
             return
-        self._tau_updated = True
         max_last = max(e.get("last_used", 0) for e in self._manifest.values())
         if max_last <= 0:
             return
