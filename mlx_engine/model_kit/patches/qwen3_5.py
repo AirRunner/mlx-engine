@@ -281,7 +281,7 @@ class PatchedQwen3_5TextModel(Qwen3_5TextModel):
                 hidden_states, mask=mask, cache=layer_cache, position_ids=position_ids
             )
 
-        return self.norm(hidden_states)
+        return hidden_states
 
     def _compute_position_ids(self, inputs: mx.array, cache) -> Optional[mx.array]:
         """
