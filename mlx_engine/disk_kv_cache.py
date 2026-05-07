@@ -182,15 +182,17 @@ class PagedDiskKVCache:
         self,
         cache_dir: Path = CACHE_DIR,
         block_size: int = BLOCK_SIZE,
+        model_path: str = "",
     ) -> None:
         self._cache_dir = cache_dir
         self._block_size = block_size
+        self._model_path = model_path
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._manifest_path = self._cache_dir / "manifest.json"
         self._manifest: dict = _load_json(self._manifest_path, {})
         self._tau_path = self._cache_dir / "session_tau.json"
         tau_data = _load_json(self._tau_path, {})
-        self._tau_gaps: list[float] = tau_data.get("gaps", [])
+        self._tau_gaps: list[float] = tau_data.get(model_path, {}).get("gaps", [])
         self._tau: Optional[float] = (
             sum(self._tau_gaps) / len(self._tau_gaps) if self._tau_gaps else None
         )
@@ -342,9 +344,14 @@ class PagedDiskKVCache:
 
     def _maybe_update_tau(self, now: float) -> None:
         """Measure the inter-session gap and update the stored tau."""
-        if not self._manifest:
+        model_entries = [
+            e
+            for e in self._manifest.values()
+            if e.get("model_path") == self._model_path
+        ]
+        if not model_entries:
             return
-        max_last = max(e.get("last_used", 0) for e in self._manifest.values())
+        max_last = max(e.get("last_used", 0) for e in model_entries)
         if max_last <= 0:
             return
         # Floor at 1h: technical guard for restarts that happen seconds after last use.
@@ -359,14 +366,18 @@ class PagedDiskKVCache:
         )
 
     def _save_tau(self) -> None:
-        _save_json(self._tau_path, {"gaps": self._tau_gaps})
+        tau_data = _load_json(self._tau_path, {})
+        tau_data[self._model_path] = {"gaps": self._tau_gaps}
+        _save_json(self._tau_path, tau_data)
 
     def _compute_tau(self, now: float) -> float:
         if self._tau is not None:
             return self._tau
         # Bootstrap: no stored tau yet (first ever session). Arithmetic mean of ages.
         ages = [
-            max(now - e.get("last_used", now), 1.0) for e in self._manifest.values()
+            max(now - e.get("last_used", now), 1.0)
+            for e in self._manifest.values()
+            if e.get("model_path") == self._model_path
         ]
         return sum(ages) / len(ages) if ages else 1.0
 

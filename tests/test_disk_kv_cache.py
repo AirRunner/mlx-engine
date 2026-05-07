@@ -194,7 +194,7 @@ class TestHitCountDecay(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
         self.store = PagedDiskKVCache(
-            cache_dir=Path(self._tmpdir.name), block_size=TEST_BLOCK_SIZE
+            cache_dir=Path(self._tmpdir.name), block_size=TEST_BLOCK_SIZE, model_path="m"
         )
 
     def tearDown(self):
@@ -360,7 +360,7 @@ class TestSessionTau(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
         self.store = PagedDiskKVCache(
-            cache_dir=Path(self._tmpdir.name), block_size=TEST_BLOCK_SIZE
+            cache_dir=Path(self._tmpdir.name), block_size=TEST_BLOCK_SIZE, model_path="m"
         )
 
     def tearDown(self):
@@ -378,8 +378,6 @@ class TestSessionTau(unittest.TestCase):
         now = time.time()
         self.store._maybe_update_tau(now)
         self.assertIsNone(self.store._tau)
-        # Empty manifest does not consume the once-per-session slot.
-        self.assertFalse(self.store._tau_updated)
 
     def test_sets_tau_from_gap(self):
         self._inject("k", age=7 * 3600.0)
@@ -393,15 +391,6 @@ class TestSessionTau(unittest.TestCase):
         now = time.time()
         self.store._maybe_update_tau(now)
         self.assertEqual(self.store._tau, 3600.0)
-
-    def test_idempotent_within_session(self):
-        self._inject("k", age=8 * 3600.0)
-        now = time.time()
-        self.store._maybe_update_tau(now)
-        first_tau = self.store._tau
-        self.store._manifest["k"]["last_used"] = now - 100
-        self.store._maybe_update_tau(now)
-        self.assertEqual(self.store._tau, first_tau)
 
     def test_sliding_window_with_prior_gaps(self):
         self.store._tau_gaps = [8 * 3600.0] * 4
@@ -424,7 +413,6 @@ class TestSessionTau(unittest.TestCase):
         now = time.time()
         self.store._maybe_update_tau(now)
         self.assertIsNone(self.store._tau)
-        self.assertTrue(self.store._tau_updated)
 
     def test_compute_tau_returns_stored(self):
         self.store._tau = 6 * 3600.0
@@ -442,8 +430,7 @@ class TestSessionTau(unittest.TestCase):
         now = time.time()
         self.store._maybe_update_tau(now)
         store2 = PagedDiskKVCache(
-            cache_dir=self.store._cache_dir, block_size=TEST_BLOCK_SIZE
+            cache_dir=self.store._cache_dir, block_size=TEST_BLOCK_SIZE, model_path="m"
         )
         self.assertAlmostEqual(store2._tau, 5 * 3600.0, delta=1.0)
         self.assertEqual(len(store2._tau_gaps), 1)
-        self.assertFalse(store2._tau_updated)

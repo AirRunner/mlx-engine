@@ -110,7 +110,7 @@ class CacheWrapper:
         self._tokenizer = tokenizer
         self._model_path: str = model_path
         self._disk_store: Optional[PagedDiskKVCache] = (
-            PagedDiskKVCache() if model_path else None
+            PagedDiskKVCache(model_path=model_path) if model_path else None
         )
         self._disk_save_queue: list[tuple] = []
 
