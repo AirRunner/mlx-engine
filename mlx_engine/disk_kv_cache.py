@@ -216,6 +216,7 @@ class PagedDiskKVCache:
     ) -> None:
         """Persist a per-block KV slice + GDN snapshot to disk."""
         key = block_hash.hex()
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
         path = self._cache_dir / f"{key}.safetensors"
 
         if key not in self._manifest and self._is_eviction_candidate(key, model_path):
