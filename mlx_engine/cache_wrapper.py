@@ -289,34 +289,22 @@ class CacheWrapper:
                 return cache, prompt_tokens[start:]
 
             # Exact hit: try to trim 1 token to seed decode.
-            if can_trim_prompt_cache(cache) and trim_prompt_cache(cache, 1) == 1:
-                self._record_lru_hit(token_list, len(token_list) - 1)
-                return cache, prompt_tokens[-1:]
+            # Skip for hybrid caches (ArraysCache + KVCache): trim() resets
+            # recurrent state entirely, _prev_checkpoint preserves correct GDN.
+            if can_trim_prompt_cache(cache) and not any(
+                isinstance(c, ArraysCache) for c in cache
+            ):
+                if trim_prompt_cache(cache, 1) == 1:
+                    self._record_lru_hit(token_list, len(token_list) - 1)
+                    return cache, prompt_tokens[-1:]
 
         if len(prompt_tokens) <= 1:
             return None, prompt_tokens
 
-        # Exact hits need one token outside the cache to seed decode. If the
-        # exact-hit cache cannot be trimmed, retry with one less prompt token
-        # so a stored checkpoint can win.
-        truncated_norm, truncated_orig = self._normalize_think_tokens(token_list[:-1])
-        cache, rest = self._history.fetch_nearest_cache(
-            self._history_key,
-            truncated_norm,
-        )
-        if cache is not None:
-            cached_norm = len(truncated_norm) - len(rest)
-            start = (
-                truncated_orig[cached_norm]
-                if cached_norm < len(truncated_orig)
-                else len(token_list) - 1
-            )
-            self._record_lru_hit(token_list, start)
-            return cache, prompt_tokens[start:]
-
-        # Prev-checkpoint fallback: if LRU missed but the current prompt
-        # shares the same normalized prefix as the last finalized turn,
-        # reuse the live cache directly (no deepcopy) and prefill the delta.
+        # Prev-checkpoint fallback: if the current prompt extends the last
+        # finalized turn's prefix, reuse _live_cache and prefill the delta.
+        # Checked before the retry to prevent fetch_nearest_cache from
+        # returning a cache with reset ArraysCache state for hybrid models.
         if (
             self._prev_checkpoint is not None
             and self._live_cache is not None
@@ -335,6 +323,24 @@ class CacheWrapper:
             self._apply_gdn_snapshot(self._prev_checkpoint.gdn_snapshot, n_to_trim)
             self._record_lru_hit(token_list, self._prev_checkpoint.kv_len)
             return self._live_cache, prompt_tokens[self._prev_checkpoint.kv_len :]
+
+        # Exact hits need one token outside the cache to seed decode. If the
+        # exact-hit cache cannot be trimmed, retry with one less prompt token
+        # so a stored checkpoint can win.
+        truncated_norm, truncated_orig = self._normalize_think_tokens(token_list[:-1])
+        cache, rest = self._history.fetch_nearest_cache(
+            self._history_key,
+            truncated_norm,
+        )
+        if cache is not None and not any(isinstance(c, ArraysCache) for c in cache):
+            cached_norm = len(truncated_norm) - len(rest)
+            start = (
+                truncated_orig[cached_norm]
+                if cached_norm < len(truncated_orig)
+                else len(token_list) - 1
+            )
+            self._record_lru_hit(token_list, start)
+            return cache, prompt_tokens[start:]
 
         if self._disk_store:
             result = self._disk_store.find_and_load(
