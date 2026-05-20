@@ -27,6 +27,7 @@ CACHE_DIR = Path.home() / ".cache" / "mlx-engine" / "kv_cache"
 _MAX_CACHE_BYTES = int(os.environ.get("MLX_DISK_KV_CACHE_MAX_GB", "5")) * 1024**3
 _INITIAL_HIT_COUNT = 1
 _TAU_WINDOW = 100
+_TAU_MIN_GAP = 3600.0  # minimum inter-session gap recorded for tau
 
 
 def _load_json(path: Path, default):
@@ -355,8 +356,10 @@ class PagedDiskKVCache:
         max_last = max(e.get("last_used", 0) for e in model_entries)
         if max_last <= 0:
             return
-        # Floor at 1h: technical guard for restarts that happen seconds after last use.
-        gap = max(now - max_last, 3600.0)
+        # Skip short gaps, they are noise not signal
+        gap = now - max_last
+        if gap < _TAU_MIN_GAP:
+            return
         self._tau_gaps.append(gap)
         if len(self._tau_gaps) > _TAU_WINDOW:
             self._tau_gaps.pop(0)
