@@ -66,20 +66,23 @@ def compute_block_hashes(token_list: list, block_size: int = BLOCK_SIZE) -> list
     return hashes
 
 
-def _state_kind(state) -> str:
+def _state_kind(state, layer=None) -> str:
     """Classify a cache layer's state without relying on class identity.
 
-    Returns 'quantized', 'plain', 'arrays', or 'unknown'.
+    Returns 'quantized', 'plain', 'rotating', 'arrays', or 'unknown'.
     Structure rules:
-      - list                   -> ArraysCache (GDN state)
-      - tuple[tuple, tuple]    -> QuantizedKVCache (packed key/value components)
-      - tuple[mx.array, ...]   -> KVCache (raw key/value tensors)
+      - list                        -> ArraysCache (GDN state)
+      - tuple[tuple, tuple]         -> QuantizedKVCache (packed key/value components)
+      - tuple[mx.array, ...] + ""   -> KVCache (raw key/value tensors)
+      - tuple[mx.array, ...] + meta -> RotatingKVCache (non-empty meta_state)
     """
     if isinstance(state, list):
         return "arrays"
     if isinstance(state[0], (list, tuple)):
         return "quantized"
     if isinstance(state[0], mx.array):
+        if layer is not None and layer.meta_state != "":
+            return "rotating"
         return "plain"
     return "unknown"
 
@@ -96,7 +99,7 @@ def _slice_cache(cache: list, start: int, end: int) -> list:
     result = []
     for layer in cache:
         state = layer.state
-        kind = _state_kind(state)
+        kind = _state_kind(state, layer)
         if kind == "quantized":
             ks, vs = state
             new_layer = QuantizedKVCache.__new__(QuantizedKVCache)
@@ -106,8 +109,7 @@ def _slice_cache(cache: list, start: int, end: int) -> list:
             )
             # Preserve all meta fields (group_size, bits, etc.); update offset only.
             new_layer.meta_state = (str(end - start),) + tuple(layer.meta_state[1:])
-        elif kind == "plain" and not hasattr(layer, "meta_state"):
-            # RotatingKVCache also has plain state but carries meta_state, so it falls through.
+        elif kind == "plain":
             ks, vs = state
             new_layer = KVCache.__new__(KVCache)
             new_layer.state = (ks[..., start:end, :], vs[..., start:end, :])
@@ -131,8 +133,9 @@ def _concatenate_block_caches(block_caches: list) -> list:
     n_layers = len(block_caches[0])
     result = []
     for i in range(n_layers):
-        first_state = block_caches[0][i].state
-        kind = _state_kind(first_state)
+        first_layer = block_caches[0][i]
+        first_state = first_layer.state
+        kind = _state_kind(first_state, first_layer)
         if kind == "quantized":
             all_ks = [bc[i].state[0] for bc in block_caches]
             all_vs = [bc[i].state[1] for bc in block_caches]
@@ -149,8 +152,7 @@ def _concatenate_block_caches(block_caches: list) -> list:
                 str(sum(bc[i].offset for bc in block_caches)),
             ) + tuple(block_caches[0][i].meta_state[1:])
             result.append(new_layer)
-        elif kind == "plain" and not hasattr(block_caches[0][i], "meta_state"):
-            # RotatingKVCache also has plain state but carries meta_state, so it falls through.
+        elif kind == "plain":
             all_ks = [bc[i].state[0] for bc in block_caches]
             all_vs = [bc[i].state[1] for bc in block_caches]
             new_layer = KVCache.__new__(KVCache)
