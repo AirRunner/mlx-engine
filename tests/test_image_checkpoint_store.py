@@ -52,7 +52,7 @@ class TestImageCheckpointStore(unittest.TestCase):
         )
 
     def test_validate_stale_when_out_of_bounds(self):
-        ids = list(range(50))  # only 50 tokens; stored end_idx=100
+        ids = list(range(50))  # only 50 tokens, stored end_idx=100
         s = _store((("h1",), 100, 0, (50,)))
         self.assertTrue(s.validate_image_checkpoint(("h1",), ids, IMG_TOK, None, (50,)))
 
@@ -62,7 +62,7 @@ class TestImageCheckpointStore(unittest.TestCase):
         self.assertTrue(s.validate_image_checkpoint(("h1",), ids, IMG_TOK, None, (50,)))
 
     def test_validate_pad_only_gap_accepted(self):
-        # Stored checkpoint had 5 image tokens; re-padded to 10. Extra tokens are IMG_TOK.
+        # Stored checkpoint had 5 image tokens, re-padded to 10. Extra tokens are IMG_TOK.
         ids = list(range(10)) + [IMG_TOK] * 10 + list(range(20, 30))
         s = _store((("h1",), 15, _hash(ids, 15), (5,)))
         self.assertFalse(

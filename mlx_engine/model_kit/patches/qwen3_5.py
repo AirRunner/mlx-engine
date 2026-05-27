@@ -305,7 +305,7 @@ class PatchedQwen3_5TextModel(Qwen3_5TextModel):
 
         batch_size, seq_length = inputs.shape
 
-        # Text-only path; no MRoPE state was injected for this call.
+        # Text-only path. No MRoPE state was injected for this call.
         # Return None so PatchedDecoderLayer uses the original nn.RoPE path.
         if self.position_ids is None and self.rope_deltas is None:
             return None

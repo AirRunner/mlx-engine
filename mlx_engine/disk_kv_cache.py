@@ -107,7 +107,7 @@ def _slice_cache(cache: list, start: int, end: int) -> list:
                 tuple(t[..., start:end, :] for t in ks),
                 tuple(t[..., start:end, :] for t in vs),
             )
-            # Preserve all meta fields (group_size, bits, etc.); update offset only.
+            # Preserve all meta fields (group_size, bits, etc.). Update offset only.
             new_layer.meta_state = (str(end - start),) + tuple(layer.meta_state[1:])
         elif kind == "plain":
             ks, vs = state

@@ -1,13 +1,14 @@
 import math
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 
 import mlx.core as mx
 
 import mlx_engine.disk_kv_cache as dkvc
-from mlx_engine.cache_wrapper import CacheWrapper
+from mlx_engine.cache_wrapper import CacheWrapper, DEFAULT_CHECKPOINT_TAIL_TOKENS
 from mlx_engine.disk_kv_cache import PagedDiskKVCache, compute_block_hashes
 from mlx_engine.generate import load_model, tokenize
 from tests.shared import RecordingReporter, model_getter
@@ -75,11 +76,20 @@ class TestPagedDiskKVCache(unittest.TestCase):
     def tearDown(self):
         self._tmpdir.cleanup()
 
-    def _make_cache_wrapper(self) -> CacheWrapper:
+    @staticmethod
+    def _make_think_tokenizer(think_start: int = 100, think_end: int = 101):
+        tok = types.SimpleNamespace()
+        tok.has_thinking = True
+        tok.think_start_id = think_start
+        tok.think_end_id = think_end
+        return tok
+
+    def _make_cache_wrapper(self, tokenizer=None) -> CacheWrapper:
         cw = CacheWrapper(
             self.model_kit.model,
             max_kv_size=4096,
             chunk_size=TEST_BLOCK_SIZE,
+            tokenizer=tokenizer,
         )
         cw._model_path = self.model_path_str
         cw._disk_store = PagedDiskKVCache(
@@ -129,6 +139,110 @@ class TestPagedDiskKVCache(unittest.TestCase):
             cached,
             TEST_BLOCK_SIZE,
             f"expected disk cache hit of at least {TEST_BLOCK_SIZE} tokens, got {cached}",
+        )
+
+    def _assert_disk_hit_after_think_strip(
+        self, tok, turn1: mx.array, turn2: mx.array, label: str
+    ) -> None:
+        """Session 1 saves blocks with think tokens; session 2 hits after stripping."""
+        cw_first = self._make_cache_wrapper(tokenizer=tok)
+        cw_first.update_cache(turn1, RecordingReporter(), num_tokens_to_exclude=1)
+        cw_first.finalize_generation()
+        self.assertGreater(
+            len(list(self.cache_dir.glob("*.safetensors"))), 0, "no blocks saved"
+        )
+
+        cw_second = self._make_cache_wrapper(tokenizer=tok)
+        reporter = RecordingReporter()
+        cw_second.update_cache(turn2, reporter, num_tokens_to_exclude=1)
+        cached = next(e for e in reporter.events if e["type"] == "begin")[
+            "cached_tokens"
+        ]
+        self.assertGreaterEqual(cached, TEST_BLOCK_SIZE, f"{label}: got {cached}")
+
+    def test_disk_cache_hit_think_inside_block(self):
+        """Disk hit when think is inside one block's raw window (causes think inflation)."""
+        tok = self._make_think_tokenizer()
+        TS, TE = tok.think_start_id, tok.think_end_id
+        prefix_ids = tokenize(self.model_kit, _make_long_prompt(TEST_BLOCK_SIZE // 2))
+        result_ids = tokenize(self.model_kit, _make_long_prompt(TEST_BLOCK_SIZE * 3))
+        turn1 = mx.array(prefix_ids + [TS] + [150] * 20 + [TE] + result_ids)
+        turn2 = mx.array(prefix_ids + result_ids + [200])
+        self._assert_disk_hit_after_think_strip(tok, turn1, turn2, "think inside block")
+
+    def test_disk_cache_hit_multiple_think_blocks(self):
+        """Disk hit when two separate think blocks are stripped across sessions."""
+        tok = self._make_think_tokenizer()
+        TS, TE = tok.think_start_id, tok.think_end_id
+        prefix_ids = tokenize(self.model_kit, _make_long_prompt(TEST_BLOCK_SIZE))
+        middle_ids = tokenize(self.model_kit, _make_long_prompt(TEST_BLOCK_SIZE))
+        result_ids = tokenize(self.model_kit, _make_long_prompt(TEST_BLOCK_SIZE))
+        turn1 = mx.array(
+            prefix_ids
+            + [TS]
+            + [150] * 15
+            + [TE]
+            + middle_ids
+            + [TS]
+            + [160] * 15
+            + [TE]
+            + result_ids
+        )
+        turn2 = mx.array(prefix_ids + middle_ids + result_ids + [200])
+        self._assert_disk_hit_after_think_strip(tok, turn1, turn2, "two think blocks")
+
+    def test_finalize_after_disk_hit_correct_kv_len(self):
+        """After disk hit with think inflation, finalize trims KV to cp.kv_len exactly."""
+        tok = self._make_think_tokenizer()
+        TS, TE = tok.think_start_id, tok.think_end_id
+
+        prefix_ids = tokenize(self.model_kit, _make_long_prompt(TEST_BLOCK_SIZE // 2))
+        result_ids = tokenize(self.model_kit, _make_long_prompt(TEST_BLOCK_SIZE * 3))
+
+        turn1 = mx.array(prefix_ids + [TS] + [150] * 20 + [TE] + result_ids)
+        cw_first = self._make_cache_wrapper(tokenizer=tok)
+        cw_first.update_cache(turn1, RecordingReporter(), num_tokens_to_exclude=1)
+        cw_first.finalize_generation()
+
+        self.assertGreater(
+            len(list(self.cache_dir.glob("*.safetensors"))), 0, "no blocks saved"
+        )
+
+        # Fixed tail ensures checkpoint_prefix_len > kv_layer.offset from the disk hit.
+        tail = [200] * (2 * TEST_BLOCK_SIZE + DEFAULT_CHECKPOINT_TAIL_TOKENS)
+        turn2 = mx.array(prefix_ids + result_ids + tail)
+        cw_second = self._make_cache_wrapper(tokenizer=tok)
+        reporter2 = RecordingReporter()
+        cw_second.update_cache(turn2, reporter2, num_tokens_to_exclude=1)
+
+        begin = next(e for e in reporter2.events if e["type"] == "begin")
+        cached = begin["cached_tokens"]
+        if cached == 0:
+            self.skipTest("no disk hit — cannot verify n_to_trim fix")
+
+        cp = cw_second._prefill_checkpoint
+        if cp is None:
+            self.skipTest(
+                "checkpoint not stored after disk hit: "
+                f"cached={cached} len(turn2)={len(turn2)} — increase tail size"
+            )
+        expected_kv = cp.kv_len
+
+        # Simulate generation without actual decode (KV offset stays fixed)
+        for i in range(5):
+            cw_second.record_generated_token(300 + i)
+
+        cw_second.finalize_generation()
+
+        kv_offset = next(
+            (c.offset for c in cw_second._live_cache if hasattr(c, "offset")), None
+        )
+        self.assertIsNotNone(kv_offset, "no KV layer found in live cache")
+        self.assertEqual(
+            kv_offset,
+            expected_kv,
+            f"KV offset ({kv_offset}) != checkpoint kv_len ({expected_kv}) after finalize: "
+            "n_to_trim was computed incorrectly (think inflation not accounted for)",
         )
 
     def test_sysprompt_stability(self):
@@ -194,7 +308,9 @@ class TestHitCountDecay(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
         self.store = PagedDiskKVCache(
-            cache_dir=Path(self._tmpdir.name), block_size=TEST_BLOCK_SIZE, model_path="m"
+            cache_dir=Path(self._tmpdir.name),
+            block_size=TEST_BLOCK_SIZE,
+            model_path="m",
         )
 
     def tearDown(self):
@@ -360,7 +476,9 @@ class TestSessionTau(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
         self.store = PagedDiskKVCache(
-            cache_dir=Path(self._tmpdir.name), block_size=TEST_BLOCK_SIZE, model_path="m"
+            cache_dir=Path(self._tmpdir.name),
+            block_size=TEST_BLOCK_SIZE,
+            model_path="m",
         )
 
     def tearDown(self):
@@ -386,11 +504,12 @@ class TestSessionTau(unittest.TestCase):
         self.assertAlmostEqual(self.store._tau, 7 * 3600.0, delta=1.0)
         self.assertEqual(len(self.store._tau_gaps), 1)
 
-    def test_floor_applied_for_short_gap(self):
+    def test_short_gap_skipped(self):
+        # Gaps shorter than _TAU_MIN_GAP are ignored, tau stays None.
         self._inject("k", age=60.0)
         now = time.time()
         self.store._maybe_update_tau(now)
-        self.assertEqual(self.store._tau, 3600.0)
+        self.assertIsNone(self.store._tau)
 
     def test_sliding_window_with_prior_gaps(self):
         self.store._tau_gaps = [8 * 3600.0] * 4

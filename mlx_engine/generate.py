@@ -657,7 +657,7 @@ def _process_modelkit_image_cache(
             start_idx = 0
 
         # Restore full MRoPE state so suffix tokens use the original stored positions.
-        # rope_deltas was already set by _prepare_inputs; position_ids completes it.
+        # rope_deltas was already set by _prepare_inputs, position_ids completes it.
         if position_ids is not None:
             model_kit.model.language_model.model.position_ids = position_ids
 

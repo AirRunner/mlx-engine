@@ -333,7 +333,7 @@ class CacheWrapper:
 
         if self._disk_store:
             result = self._disk_store.find_and_load(
-                token_list,
+                norm_tokens,
                 self._model_path,
                 kv_bits=self._kv_cache_qtn_params.get("kv_bits"),
             )
@@ -403,7 +403,7 @@ class CacheWrapper:
                 and current_cache_size == checkpoint_prefix_len
             ):
                 # GDN snapshot at checkpoint boundary (before <think>).
-                # KV layers are trimmed back to this point in finalize_generation();
+                # KV layers are trimmed back to this point in finalize_generation().
                 # ArraysCache (GDN) layers are restored from this snapshot in-place.
                 gdn_snapshot = [
                     copy.deepcopy(c) if isinstance(c, ArraysCache) else None
@@ -465,9 +465,10 @@ class CacheWrapper:
 
         if self._disk_store:
             bs = self._disk_store._block_size
-            hashes = compute_block_hashes(token_list, bs)
+            norm_tokens_disk, norm_orig_disk = self._normalize_think_tokens(token_list)
+            hashes = compute_block_hashes(norm_tokens_disk, bs)
             self._disk_save_queue = [
-                (h, i * bs, (i + 1) * bs)
+                (h, norm_orig_disk[i * bs], norm_orig_disk[(i + 1) * bs - 1] + 1)
                 for i, h in enumerate(hashes)
                 if self._disk_store.should_save_block(h, self._model_path)
             ]
@@ -581,7 +582,12 @@ class CacheWrapper:
         if self._prefill_checkpoint is None or self._live_tokens is None:
             return
         cp = self._prefill_checkpoint
-        n_to_trim = len(self._live_tokens) - cp.kv_len
+        kv_layer = next((c for c in self._live_cache if hasattr(c, "offset")), None)
+        n_to_trim = (
+            kv_layer.offset - cp.kv_len
+            if kv_layer is not None
+            else len(self._live_tokens) - cp.kv_len
+        )
         # Preserve prev-checkpoint before _restore_and_insert clears it.
         self._prev_checkpoint = _PrefillCheckpoint(
             gdn_snapshot=cp.gdn_snapshot,
