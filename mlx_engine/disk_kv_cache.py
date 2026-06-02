@@ -200,6 +200,14 @@ class PagedDiskKVCache:
             sum(self._tau_gaps) / len(self._tau_gaps) if self._tau_gaps else None
         )
         self._maybe_update_tau(time.time())
+        self._cleanup_orphans()
+
+    def _cleanup_orphans(self) -> None:
+        known = set(self._manifest.keys())
+        for path in self._cache_dir.glob("*.safetensors"):
+            if path.stem not in known:
+                path.unlink(missing_ok=True)
+                logger.info(f"[kv-disk] removed orphan {path.name[:16]}…")
 
     def should_save_block(self, block_hash: bytes, model_path: str) -> bool:
         """Return True if this block is not already on disk for this model."""
