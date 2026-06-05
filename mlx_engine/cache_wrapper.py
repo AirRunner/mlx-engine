@@ -306,6 +306,18 @@ class CacheWrapper:
             and norm_tokens[: len(self._prev_checkpoint.lru_key)]
             == self._prev_checkpoint.lru_key
         ):
+            # finalize_generation may have been skipped (client disconnect with
+            # no _prefill_checkpoint captured), leaving _live_cache in
+            # post-generation state. Detect via KV offset and restore GDN +
+            # trim KV back to the checkpoint boundary before reusing.
+            kv_layer = next((c for c in self._live_cache if hasattr(c, "offset")), None)
+            if kv_layer is None or kv_layer.offset > self._prev_checkpoint.kv_len:
+                n_to_trim = (
+                    kv_layer.offset - self._prev_checkpoint.kv_len
+                    if kv_layer is not None
+                    else 0
+                )
+                self._apply_gdn_snapshot(self._prev_checkpoint.gdn_snapshot, n_to_trim)
             return self._live_cache, prompt_tokens[self._prev_checkpoint.kv_len :]
 
         return None, prompt_tokens
@@ -493,15 +505,19 @@ class CacheWrapper:
         )
         return uncached_tokens[-num_tokens_to_exclude:]
 
-    def _restore_and_insert(
-        self, gdn_snapshot: list, lru_key: list, n_to_trim: int
-    ) -> None:
-        """Restore GDN layers from snapshot, trim KV layers, and insert into history."""
+    def _apply_gdn_snapshot(self, gdn_snapshot: list, n_to_trim: int) -> None:
+        """Restore GDN layers from snapshot and trim KV layers in _live_cache."""
         for c, snap in zip(self._live_cache, gdn_snapshot):
             if snap is not None:
                 c.cache = snap.cache
             else:
                 c.trim(n_to_trim)
+
+    def _restore_and_insert(
+        self, gdn_snapshot: list, lru_key: list, n_to_trim: int
+    ) -> None:
+        """Restore GDN layers from snapshot, trim KV layers, and insert into history."""
+        self._apply_gdn_snapshot(gdn_snapshot, n_to_trim)
         lru_key_arr = mx.array(lru_key)
         self._store_snapshot(lru_key_arr, self._live_cache, cache_type="user")
         self._prefill_checkpoint = None
