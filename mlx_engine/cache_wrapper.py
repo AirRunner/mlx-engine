@@ -10,7 +10,6 @@ import mlx.nn as nn
 from mlx_lm.generate import generation_stream, maybe_quantize_kv_cache
 from mlx_lm.models.cache import (
     ArraysCache,
-    KVCache,
     LRUPromptCache,
     can_trim_prompt_cache,
     make_prompt_cache,
@@ -308,10 +307,10 @@ class CacheWrapper:
         ):
             # Always restore GDN: finalize may be a no-op (no _prefill_checkpoint),
             # leaving GDN post-generation even when KV offset appears clean.
-            kv_layer = next((c for c in self._live_cache if hasattr(c, "offset")), None)
+            kv_offset = self._num_tokens_in_cache()
             n_to_trim = (
-                kv_layer.offset - self._prev_checkpoint.kv_len
-                if kv_layer is not None
+                (kv_offset - self._prev_checkpoint.kv_len)
+                if kv_offset is not None
                 else 0
             )
             self._apply_gdn_snapshot(self._prev_checkpoint.gdn_snapshot, n_to_trim)
@@ -475,12 +474,10 @@ class CacheWrapper:
                 ):
                     # Cancelled before checkpoint: roll back to the previous
                     # turn's state and re-insert into the history.
-                    kv_layer = next(
-                        (c for c in self._live_cache if isinstance(c, KVCache)), None
-                    )
+                    kv_offset = self._num_tokens_in_cache()
                     n_to_trim = (
-                        (kv_layer.offset - self._prev_checkpoint.kv_len)
-                        if kv_layer
+                        (kv_offset - self._prev_checkpoint.kv_len)
+                        if kv_offset is not None
                         else 0
                     )
                     self._restore_and_insert(
