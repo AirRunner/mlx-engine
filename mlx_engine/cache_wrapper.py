@@ -306,18 +306,15 @@ class CacheWrapper:
             and norm_tokens[: len(self._prev_checkpoint.lru_key)]
             == self._prev_checkpoint.lru_key
         ):
-            # finalize_generation may have been skipped (client disconnect with
-            # no _prefill_checkpoint captured), leaving _live_cache in
-            # post-generation state. Detect via KV offset and restore GDN +
-            # trim KV back to the checkpoint boundary before reusing.
+            # Always restore GDN: finalize may be a no-op (no _prefill_checkpoint),
+            # leaving GDN post-generation even when KV offset appears clean.
             kv_layer = next((c for c in self._live_cache if hasattr(c, "offset")), None)
-            if kv_layer is None or kv_layer.offset > self._prev_checkpoint.kv_len:
-                n_to_trim = (
-                    kv_layer.offset - self._prev_checkpoint.kv_len
-                    if kv_layer is not None
-                    else 0
-                )
-                self._apply_gdn_snapshot(self._prev_checkpoint.gdn_snapshot, n_to_trim)
+            n_to_trim = (
+                kv_layer.offset - self._prev_checkpoint.kv_len
+                if kv_layer is not None
+                else 0
+            )
+            self._apply_gdn_snapshot(self._prev_checkpoint.gdn_snapshot, n_to_trim)
             return self._live_cache, prompt_tokens[self._prev_checkpoint.kv_len :]
 
         return None, prompt_tokens
