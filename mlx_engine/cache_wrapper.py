@@ -503,7 +503,7 @@ class CacheWrapper:
         """Restore GDN layers from snapshot and trim KV layers in _live_cache."""
         for c, snap in zip(self._live_cache, gdn_snapshot):
             if snap is not None:
-                c.cache = snap.cache
+                c.cache = snap.cache.copy()
             else:
                 c.trim(n_to_trim)
 
